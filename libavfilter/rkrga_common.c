@@ -1030,9 +1030,12 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
         return ret;
 
     if (r->is_rga2_used) {
-        r->scheduler_core = 0x4;
-        if (r->has_rga2p)
-            r->scheduler_core |= 0x8;
+        r->scheduler_core &= 0xc;
+        if (!r->scheduler_core) {
+            r->scheduler_core = 0x4;
+            if (r->has_rga2p)
+                r->scheduler_core |= 0x8;
+        }
     }
 
     /* Prioritize RGA3 on multicore RGA hw to avoid dma32 & algorithm quirks as much as possible */
@@ -1319,8 +1322,8 @@ static int call_rkrga_blit(AVFilterContext *avctx,
 
 #define PRINT_RGA_INFO(ctx, info, name) do { \
     if (info && name) \
-        av_log(ctx, AV_LOG_DEBUG, "RGA %s | fd:%d mmu:%d rd:%d csc:%d | x:%d y:%d w:%d h:%d ws:%d hs:%d fmt:0x%x\n", \
-               name, info->fd, info->mmuFlag, (info->rd_mode >> 1), info->color_space_mode, info->rect.xoffset, info->rect.yoffset, \
+        av_log(ctx, AV_LOG_DEBUG, "RGA %s | fd:%d mmu:%d rd:%d csc:%d core:0x%x | x:%d y:%d w:%d h:%d ws:%d hs:%d fmt:0x%x\n", \
+               name, info->fd, info->mmuFlag, (info->rd_mode >> 1), info->color_space_mode, info->core, info->rect.xoffset, info->rect.yoffset, \
                info->rect.width, info->rect.height, info->rect.wstride, info->rect.hstride, (info->rect.format >> 8)); \
 } while (0)
 
