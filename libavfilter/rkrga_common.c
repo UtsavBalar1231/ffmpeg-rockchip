@@ -905,6 +905,17 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
                av_get_pix_fmt_name(AV_PIX_FMT_NV42));
         return AVERROR(ENOSYS);
     }
+    /* RGA2-Pro only reads ARGB/ABGR 5551, which do not match the AV layouts */
+    if (r->has_rga2p &&
+        (src->pix_fmt == AV_PIX_FMT_RGB555LE ||
+         src->pix_fmt == AV_PIX_FMT_BGR555LE ||
+         (pat && (pat->pix_fmt == AV_PIX_FMT_RGB555LE ||
+                  pat->pix_fmt == AV_PIX_FMT_BGR555LE)))) {
+        av_log(avctx, AV_LOG_ERROR, "'%s' and '%s' as input are not supported by RGA2-Pro\n",
+               av_get_pix_fmt_name(AV_PIX_FMT_RGB555LE),
+               av_get_pix_fmt_name(AV_PIX_FMT_BGR555LE));
+        return AVERROR(ENOSYS);
+    }
     /* Input formats that requires RGA2 */
     if (!r->has_rga2 &&
         (src->pix_fmt == AV_PIX_FMT_GRAY8 ||
