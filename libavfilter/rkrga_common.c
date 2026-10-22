@@ -670,12 +670,18 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
         }
     }
 
-    if (pat_preproc)
+    if (pat_preproc) {
+        /* Write alpha so that the area around an opaque overlay stays transparent */
+        if (info.format == RK_FORMAT_RGBX_8888)
+            info.format = RK_FORMAT_RGBA_8888;
+        else if (info.format == RK_FORMAT_BGRX_8888)
+            info.format = RK_FORMAT_BGRA_8888;
+
         rga_set_rect(&info.rect, in1_info->overlay_x, in1_info->overlay_y,
                      FFMIN((in0_info->act_w - in1_info->overlay_x), in1_info->act_w),
                      FFMIN((in0_info->act_h - in1_info->overlay_y), in1_info->act_h),
-                     w_stride, h_stride, in1_info->rga_fmt);
-    else
+                     w_stride, h_stride, info.format);
+    } else
         rga_set_rect(&info.rect, out_info->act_x, out_info->act_y,
                      out_info->act_w, out_info->act_h,
                      w_stride, h_stride, out_info->rga_fmt);
@@ -1074,6 +1080,14 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
                (is_inlink ? "input" : "output"), nb_link,
                av_get_pix_fmt_name(hwfc->sw_format));
         return AVERROR(ENOSYS);
+    }
+
+    /* Without RGA3 the RGBA mapping would read the undefined X byte as alpha */
+    if (!r->has_rga3) {
+        if (hwfc->sw_format == AV_PIX_FMT_RGB0)
+            info->rga_fmt = RK_FORMAT_RGBX_8888;
+        else if (hwfc->sw_format == AV_PIX_FMT_BGR0)
+            info->rga_fmt = RK_FORMAT_BGRX_8888;
     }
 
     info->pix_fmt  = hwfc->sw_format;
