@@ -1355,8 +1355,16 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
         ret = rkmpp_send_packet(avctx, pkt);
         if (ret == AVERROR(EAGAIN)) {
-            /* the input queue is full: keep the packet for the next call */
-            return rkmpp_get_frame(avctx, frame, 100);
+            int64_t start = av_gettime_relative();
+
+            /* the input queue is full: keep the packet and wait for output */
+            ret = rkmpp_get_frame(avctx, frame, QUEUE_FULL_TIMEOUT);
+            if (ret == AVERROR(EAGAIN) &&
+                av_gettime_relative() - start >= QUEUE_FULL_TIMEOUT * 1000LL)
+                av_log(avctx, AV_LOG_WARNING, "No frame for %d ms with the input queue full; "
+                       "the caller may be holding every output frame, see -extra_hw_frames\n",
+                       QUEUE_FULL_TIMEOUT);
+            return ret;
         }
         av_packet_unref(pkt);
         if (ret < 0) {
