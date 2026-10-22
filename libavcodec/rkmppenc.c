@@ -705,7 +705,8 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
     return 0;
 }
 
-static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
+static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
+                              MPPEncFrame **out)
 {
     RKMPPEncContext *r = avctx->priv_data;
     MppFrame mpp_frame = NULL;
@@ -727,10 +728,11 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
 
     mpp_enc_frame = get_free_frame(&r->frame_list);
     if (!mpp_enc_frame)
-        return NULL;
+        return AVERROR(ENOMEM);
 
-    if ((ret = mpp_frame_init(&mpp_frame)) != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to init MPP frame: %d\n", ret);
+    if (mpp_frame_init(&mpp_frame) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to init MPP frame\n");
+        ret = AVERROR(ENOMEM);
         goto exit;
     }
     mpp_enc_frame->mpp_frame = mpp_frame;
@@ -738,17 +740,22 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     if (!frame) {
         av_log(avctx, AV_LOG_DEBUG, "End of stream\n");
         mpp_frame_set_eos(mpp_frame, 1);
-        return mpp_enc_frame;
+        *out = mpp_enc_frame;
+        return 0;
     }
 
     if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME) {
-        drm_frame = frame;
-        mpp_enc_frame->frame = av_frame_clone(drm_frame);
+        drm_frame = mpp_enc_frame->frame = av_frame_clone(frame);
+        if (!drm_frame) {
+            ret = AVERROR(ENOMEM);
+            goto exit;
+        }
     } else {
         AVBufferRef *hw_frames_ctx = frame->hw_frames_ctx;
 
-        drm_frame = av_frame_alloc();
+        drm_frame = mpp_enc_frame->frame = av_frame_alloc();
         if (!drm_frame) {
+            ret = AVERROR(ENOMEM);
             goto exit;
         }
         if ((ret = av_hwframe_get_buffer(r->hwframe, drm_frame, 0)) < 0) {
@@ -766,13 +773,14 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
             frame->hw_frames_ctx = hw_frames_ctx;
             goto exit;
         }
-        mpp_enc_frame->frame = drm_frame;
         frame->hw_frames_ctx = hw_frames_ctx; /* restore hwfc */
     }
 
     drm_desc = (AVDRMFrameDescriptor *)drm_frame->data[0];
-    if (drm_desc->objects[0].fd < 0)
+    if (drm_desc->objects[0].fd < 0) {
+        ret = AVERROR(EINVAL);
         goto exit;
+    }
 
     /* planar YUV quirks */
     if ((r->pix_fmt == AV_PIX_FMT_YUV420P ||
@@ -782,6 +790,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
          r->pix_fmt == AV_PIX_FMT_NV24) && (drm_frame->width % 2)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported width '%d', not 2-aligned\n",
                drm_frame->width);
+        ret = AVERROR(EINVAL);
         goto exit;
     }
     /* packed RGB/YUV quirks */
@@ -789,6 +798,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
         (drm_frame->width % 2 || drm_frame->height % 2)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported size '%dx%d', not 2-aligned\n",
                drm_frame->width, drm_frame->height);
+        ret = AVERROR(EINVAL);
         goto exit;
     }
 
@@ -814,6 +824,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     if (!is_afbc &&
         drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
         av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
+        ret = AVERROR(ENOSYS);
         goto exit;
     }
     if (is_afbc &&
@@ -821,6 +832,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
           avctx->codec_id == AV_CODEC_ID_HEVC)) {
         av_log(avctx, AV_LOG_ERROR, "AFBC is not supported in codec '%s'\n",
                avcodec_get_name(avctx->codec_id));
+        ret = AVERROR(ENOSYS);
         goto exit;
     }
     if (is_afbc) {
@@ -830,6 +842,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
         if (drm_afbc_fmt != layer->format) {
             av_log(avctx, AV_LOG_ERROR, "Input format '%s' with AFBC modifier is not supported\n",
                    av_get_pix_fmt_name(r->pix_fmt));
+            ret = AVERROR(ENOSYS);
             goto exit;
         }
         mpp_fmt |= MPP_FRAME_FBC_AFBC_V2;
@@ -858,6 +871,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
                               &hor_stride, &ver_stride);
         if (ret < 0 || !hor_stride || !ver_stride) {
             av_log(avctx, AV_LOG_ERROR, "Failed to get frame strides\n");
+            ret = AVERROR(EINVAL);
             goto exit;
         }
 
@@ -871,6 +885,7 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
 
     if ((ret = mpp_buffer_import(&mpp_buf, &buf_info)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to import MPP buffer: %d\n", ret);
+        ret = AVERROR_EXTERNAL;
         goto exit;
     }
     /* the frame keeps its own reference */
@@ -886,14 +901,12 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
             goto exit;
     }
 
-    return mpp_enc_frame;
+    *out = mpp_enc_frame;
+    return 0;
 
 exit:
-    if (drm_frame &&
-        avctx->pix_fmt != AV_PIX_FMT_DRM_PRIME)
-        av_frame_free(&drm_frame);
-
-    return NULL;
+    release_frame(mpp_enc_frame);
+    return ret;
 }
 
 static int rkmpp_send_frame(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
@@ -1046,16 +1059,15 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
         (frame && get_used_frame_count(r->frame_list) > r->async_frames))
         goto get;
 
-    mpp_enc_frame = rkmpp_submit_frame(avctx, (AVFrame *)frame);
-    if (!mpp_enc_frame) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to submit frame on input\n");
-        return AVERROR(ENOMEM);
-    }
+    if ((ret = rkmpp_submit_frame(avctx, (AVFrame *)frame, &mpp_enc_frame)) < 0)
+        return ret;
 
     while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN))
         ;
-    if (ret)
+    if (ret) {
+        release_frame(mpp_enc_frame);
         return ret;
+    }
     if (!frame)
         r->eos_sent = 1;
 
