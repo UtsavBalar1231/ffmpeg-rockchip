@@ -302,6 +302,12 @@ static void set_colorspace_info(RGAFrameInfo *in_info,
                 out_mode = is_rga2_used ? (0xb << 8) /* rgb2yuv_709_limit */
                                         : (3 << 2);  /* IM_RGB_TO_YUV_BT709_LIMIT */
             }
+        } else {
+            /* The hardware default is IM_RGB_TO_YUV_BT601_LIMIT */
+            if (out_spc)
+                *out_spc = AVCOL_SPC_BT470BG;
+            if (out_rng)
+                *out_rng = AVCOL_RANGE_MPEG;
         }
         if (out_mode)
             *color_space_mode |= out_mode;
