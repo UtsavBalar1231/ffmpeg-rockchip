@@ -782,8 +782,12 @@ static void rkmpp_export_avctx_color_props(AVCodecContext *avctx, MppFrame mpp_f
         val != MPP_FRAME_SPC_UNSPECIFIED)
         avctx->colorspace = val;
 
+    /* MPP does not tag JPEG output; JFIF samples are full range */
     if ((val = mpp_frame_get_color_range(mpp_frame)) > MPP_FRAME_RANGE_UNSPECIFIED)
         avctx->color_range = val;
+    else if (avctx->codec_id == AV_CODEC_ID_MJPEG &&
+             avctx->color_range == AVCOL_RANGE_UNSPECIFIED)
+        avctx->color_range = AVCOL_RANGE_JPEG;
 
     if ((val = mpp_frame_get_chroma_location(mpp_frame)) > MPP_CHROMA_LOC_UNSPECIFIED)
         avctx->chroma_sample_location = val;
