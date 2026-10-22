@@ -494,7 +494,7 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
 
     if (pat_preproc) {
         RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
-        rga_set_rect(&info.rect, 0, 0,
+        rga_set_rect(&info.rect, in_info->act_x, in_info->act_y,
                      FFMIN((in0_info->act_w - in_info->overlay_x), in_info->act_w),
                      FFMIN((in0_info->act_h - in_info->overlay_y), in_info->act_h),
                      w_stride, h_stride, in_info->rga_fmt);
@@ -1192,6 +1192,7 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         }
     }
     if (avctx->nb_inputs > 1) {
+        RGAFrameInfo *in1_info = &r->in_rga_frame_infos[1];
         int need_premultiply = 0;
 
         if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
@@ -1205,11 +1206,21 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         } else
             r->in_rga_frame_infos[0].blend_mode = need_premultiply ? 0x504 : 0x501;
 
-        r->in_rga_frame_infos[1].overlay_x = FFMAX(param->overlay_x, 0);
-        r->in_rga_frame_infos[1].overlay_y = FFMAX(param->overlay_y, 0);
+        /* Crop the part of the overlay that lies left of or above the main input */
+        if (param->overlay_x < 0) {
+            in1_info->act_x  = param->overlay_x > -in1_info->act_w ? -param->overlay_x : in1_info->act_w;
+            in1_info->act_w -= in1_info->act_x;
+        }
+        if (param->overlay_y < 0) {
+            in1_info->act_y  = param->overlay_y > -in1_info->act_h ? -param->overlay_y : in1_info->act_h;
+            in1_info->act_h -= in1_info->act_y;
+        }
+        in1_info->overlay_x = FFMAX(param->overlay_x, 0);
+        in1_info->overlay_y = FFMAX(param->overlay_y, 0);
 
         r->is_overlay_offset_valid = (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
-            (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2);
+            (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2) &&
+            in1_info->act_w >= 2 && in1_info->act_h >= 2;
         if (!param->in_global_alpha) {
             av_log(avctx, AV_LOG_VERBOSE, "Overlay alpha is 0, passing the main input through\n");
             r->is_overlay_offset_valid = 0;
