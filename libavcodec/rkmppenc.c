@@ -540,7 +540,7 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
                (int32_t)target_bps, (int32_t)min_bps, (int32_t)max_bps);
     }
 
-    if (avctx->rc_buffer_size > 0 &&
+    if (avctx->rc_buffer_size > 0 && max_bps > 0 &&
         (rc_mode == MPP_ENC_RC_MODE_CBR ||
          rc_mode == MPP_ENC_RC_MODE_VBR ||
          rc_mode == MPP_ENC_RC_MODE_AVBR)) {
