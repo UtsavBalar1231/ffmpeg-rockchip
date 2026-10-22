@@ -1339,7 +1339,7 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
             ret = AVERROR(ENOMEM);
             goto fail;
         }
-        avctx->extradata_size = pkt_len + AV_INPUT_BUFFER_PADDING_SIZE;
+        avctx->extradata_size = pkt_len;
         memcpy(avctx->extradata, pkt_pos, pkt_len);
         memset(avctx->extradata + pkt_len, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         mpp_packet_deinit(&mpp_pkt);
