@@ -52,8 +52,6 @@
 #include <libv4l2.h>
 #endif
 
-static const int desired_video_buffers = 256;
-
 #define V4L_ALLFORMATS  3
 #define V4L_RAWFORMATS  1
 #define V4L_COMPFORMATS 2
@@ -110,6 +108,7 @@ struct video_data {
     int list_format;    /**< Set by a private option. */
     int list_standard;  /**< Set by a private option. */
     char *framerate;    /**< Set by a private option. */
+    int requested_buffers; /**< Set by a private option. */
 
     int use_libv4l2;
     int (*open_f)(const char *file, int oflag, ...);
@@ -373,7 +372,7 @@ static int mmap_init(AVFormatContext *ctx)
     struct video_data *s = ctx->priv_data;
     struct v4l2_requestbuffers req = {
         .type   = s->buf_type,
-        .count  = desired_video_buffers,
+        .count  = s->requested_buffers,
         .memory = V4L2_MEMORY_MMAP
     };
 
@@ -1158,6 +1157,7 @@ static const AVOption options[] = {
     { "pixel_format", "set preferred pixel format",                               OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
+    { "buffers",      "set the number of capture buffers to request",            OFFSET(requested_buffers), AV_OPT_TYPE_INT, {.i64 = 256}, 1, 256,     DEC },
 
     { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, .unit = "list_formats" },
     { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, .unit = "list_formats" },

@@ -1446,6 +1446,11 @@ Default value is @code{default}.
 @item use_libv4l2
 Use libv4l2 (v4l-utils) conversion functions. Default is 0.
 
+@item buffers
+Set the number of capture buffers to request from the driver. The driver may
+grant fewer. Each buffer holds one frame, so lower values reduce the memory
+pinned for high resolutions. Default is 256.
+
 @end table
 
 @section vfwcap
