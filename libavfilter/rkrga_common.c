@@ -23,6 +23,8 @@
  * Rockchip RGA (2D Raster Graphic Acceleration) base function
  */
 
+#include <unistd.h>
+
 #include "libavutil/common.h"
 #include "libavutil/mem.h"
 #include "libavutil/pixdesc.h"
@@ -1295,15 +1297,30 @@ static void set_rga_async_frame_lock_status(RGAAsyncFrame *frame, int lock)
         frame->pat->locked = status;
 }
 
+static int rga_sync_frame(RGAAsyncFrame *frame)
+{
+    int fence_fd = frame->dst->info.out_fence_fd;
+    int ret = 0;
+
+    if (imsync(fence_fd) != IM_STATUS_SUCCESS) {
+        /* imsync() closes the fence only on success */
+        if (fence_fd > 0)
+            close(fence_fd);
+        ret = AVERROR_EXTERNAL;
+    }
+
+    set_rga_async_frame_lock_status(frame, 0);
+
+    return ret;
+}
+
 static void rga_drain_fifo(RKRGAContext *r)
 {
     RGAAsyncFrame aframe;
 
     while (r->async_fifo && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (rga_sync_frame(&aframe) < 0)
             av_log(NULL, AV_LOG_WARNING, "RGA sync failed\n");
-
-        set_rga_async_frame_lock_status(&aframe, 0);
     }
 }
 
@@ -1383,10 +1400,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
 
     /* Sync & Drain */
     while (r->eof && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS)
+        if (rga_sync_frame(&aframe) < 0)
             av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
-
-        set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
         aframe.dst->frame = NULL;
@@ -1477,11 +1492,11 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     /* Sync & Retrieve */
     if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
         av_fifo_read(r->async_fifo, &aframe, 1);
-        if (imsync(aframe.dst->info.out_fence_fd) != IM_STATUS_SUCCESS) {
+        if ((ret = rga_sync_frame(&aframe)) < 0) {
             av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
-            return AVERROR_EXTERNAL;
+            aframe.dst->queued--;
+            return ret;
         }
-        set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
         aframe.dst->frame = NULL;
