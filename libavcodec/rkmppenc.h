@@ -179,7 +179,7 @@ static const AVOption hevc_options[] = {
             { .i64 = AV_PROFILE_HEVC_MAIN }, -1, AV_PROFILE_HEVC_MAIN, VE, .unit = "profile" },
         { "main",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AV_PROFILE_HEVC_MAIN }, INT_MIN, INT_MAX, VE, .unit = "profile" },
     { "tier", "Set the encoding profile tier restriction", OFFSET(tier), AV_OPT_TYPE_INT,
-            { .i64 = 1 }, 0, 1, VE, .unit = "tier" },
+            { .i64 = 0 }, 0, 1, VE, .unit = "tier" },
         { "main",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 0 }, INT_MIN, INT_MAX, VE, .unit = "tier" },
         { "high",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = 1 }, INT_MIN, INT_MAX, VE, .unit = "tier" },
     { "level", "Set the encoding level restriction", OFFSET(level), AV_OPT_TYPE_INT,
