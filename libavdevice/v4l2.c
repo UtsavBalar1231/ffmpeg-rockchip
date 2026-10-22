@@ -916,8 +916,13 @@ static int v4l2_read_header(AVFormatContext *ctx)
         /* get current video input */
         if (v4l2_ioctl(s->fd, VIDIOC_G_INPUT, &s->channel) < 0) {
             res = AVERROR(errno);
-            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_INPUT): %s\n", av_err2str(res));
-            goto fail;
+            if (res != AVERROR(ENOTTY) && res != AVERROR(EINVAL)) {
+                av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_G_INPUT): %s\n", av_err2str(res));
+                goto fail;
+            }
+            av_log(ctx, AV_LOG_VERBOSE, "ioctl(VIDIOC_G_INPUT): %s, assuming input 0\n",
+                   av_err2str(res));
+            s->channel = 0;
         }
     }
 
