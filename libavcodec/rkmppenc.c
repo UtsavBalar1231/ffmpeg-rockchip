@@ -207,59 +207,52 @@ static unsigned get_used_frame_count(MPPEncFrame *list)
     return count;
 }
 
-static void clear_unused_frames(MPPEncFrame *list)
+static void release_frame(MPPEncFrame *frame)
 {
-    while (list) {
-        if (list->queued == 1) {
-            MppFrame mpp_frame = list->mpp_frame;
-            MppBuffer mpp_buf = NULL;
+    if (frame->mpp_frame)
+        mpp_frame_deinit(&frame->mpp_frame);
 
-            if (mpp_frame)
-                mpp_buf = mpp_frame_get_buffer(mpp_frame);
+    av_freep(&frame->mpp_sei_set.datas);
+    frame->mpp_sei_set.count = 0;
 
-            if (mpp_buf &&
-                mpp_buffer_get_index(mpp_buf) < 0) {
-                mpp_buffer_put(mpp_buf);
+    av_frame_free(&frame->frame);
+    frame->in_mpp = 0;
+    frame->queued = 0;
+}
 
-                mpp_frame_deinit(&list->mpp_frame);
-                list->mpp_frame = NULL;
+/* MPP hands each input frame back in the meta of the packet made from it. */
+static int release_input_frame(MPPEncFrame *list, MppPacket mpp_pkt)
+{
+    MppFrame mpp_frame = NULL;
 
-                av_freep(&list->mpp_sei_set.datas);
-                list->mpp_sei_set.count = 0;
+    if (!mpp_packet_has_meta(mpp_pkt) ||
+        mpp_meta_get_frame(mpp_packet_get_meta(mpp_pkt),
+                           KEY_INPUT_FRAME, &mpp_frame) != MPP_OK ||
+        !mpp_frame)
+        return AVERROR(ENOENT);
 
-                av_frame_free(&list->frame);
-                list->queued = 0;
-            }
+    for (; list; list = list->next) {
+        if (list->in_mpp && list->mpp_frame == mpp_frame) {
+            release_frame(list);
+            return 0;
         }
-        list = list->next;
     }
+
+    return AVERROR(ENOENT);
 }
 
 static void clear_frame_list(MPPEncFrame **list)
 {
     while (*list) {
-        MPPEncFrame *frame = NULL;
-        MppFrame mpp_frame = NULL;
-        MppBuffer mpp_buf = NULL;
+        MPPEncFrame *frame = *list;
 
-        frame = *list;
-        *list = (*list)->next;
+        *list = frame->next;
 
-        mpp_frame = frame->mpp_frame;
-        if (mpp_frame) {
-            mpp_buf = mpp_frame_get_buffer(mpp_frame);
-            if (mpp_buf &&
-                mpp_buffer_get_index(mpp_buf) >= 0)
-                mpp_buffer_put(mpp_buf);
-
-            mpp_frame_deinit(&frame->mpp_frame);
+        /* never handed back, so mpp_destroy() has already released it */
+        if (frame->in_mpp)
             frame->mpp_frame = NULL;
-        }
 
-        av_freep(&frame->mpp_sei_set.datas);
-        frame->mpp_sei_set.count = 0;
-
-        av_frame_free(&frame->frame);
+        release_frame(frame);
         av_freep(&frame);
     }
 }
@@ -732,8 +725,6 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
 
     MPPEncFrame *mpp_enc_frame = NULL;
 
-    clear_unused_frames(r->frame_list);
-
     mpp_enc_frame = get_free_frame(&r->frame_list);
     if (!mpp_enc_frame)
         return NULL;
@@ -878,14 +869,13 @@ static MPPEncFrame *rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame)
     buf_info.fd    = drm_desc->objects[0].fd;
     buf_info.size  = drm_desc->objects[0].size;
 
-    /* mark buffer as used (idx >= 0) */
-    buf_info.index = buf_info.fd;
-
     if ((ret = mpp_buffer_import(&mpp_buf, &buf_info)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to import MPP buffer: %d\n", ret);
         goto exit;
     }
+    /* the frame keeps its own reference */
     mpp_frame_set_buffer(mpp_frame, mpp_buf);
+    mpp_buffer_put(mpp_buf);
     mpp_frame_set_buf_size(mpp_frame, drm_desc->objects[0].size);
 
     if (r->udu_sei &&
@@ -909,14 +899,9 @@ exit:
 static int rkmpp_send_frame(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
 {
     RKMPPEncContext *r = avctx->priv_data;
-    AVFrame *frame = NULL;
-    MppFrame mpp_frame = NULL;
+    AVFrame *frame = mpp_enc_frame->frame;
+    MppFrame mpp_frame = mpp_enc_frame->mpp_frame;
     int ret;
-
-    if (mpp_enc_frame) {
-        frame = mpp_enc_frame->frame;
-        mpp_frame = mpp_enc_frame->mpp_frame;
-    }
 
     if (frame && (ret = rkmpp_set_enc_cfg_prep(avctx, frame)) < 0)
         goto exit;
@@ -936,9 +921,10 @@ static int rkmpp_send_frame(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
         ret = (ret == MPP_NOK) ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
         av_log(avctx, log_level, "Failed to put frame to encoder input queue: %d\n", ret);
         goto exit;
-    } else
-        av_log(avctx, AV_LOG_DEBUG, "Wrote %ld bytes to encoder\n",
-               mpp_frame_get_buf_size(mpp_frame));
+    }
+    mpp_enc_frame->in_mpp = 1;
+    av_log(avctx, AV_LOG_DEBUG, "Wrote %ld bytes to encoder\n",
+           mpp_frame_get_buf_size(mpp_frame));
 
 exit:
     return ret;
@@ -949,8 +935,6 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     RKMPPEncContext *r = avctx->priv_data;
     MppPacket mpp_pkt = NULL;
     MppMeta mpp_meta = NULL;
-    MppFrame mpp_frame = NULL;
-    MppBuffer mpp_buf = NULL;
     int key_frame = 0;
     int avg_qp = -1;
     int ret;
@@ -961,13 +945,15 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     }
 
     if ((ret = r->mapi->encode_get_packet(r->mctx, &mpp_pkt)) != MPP_OK) {
-        int log_level = (ret == MPP_NOK) ? AV_LOG_DEBUG : AV_LOG_ERROR;
-        ret = (ret == MPP_NOK) ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
-        av_log(avctx, log_level, "Failed to get packet from encoder output queue: %d\n", ret);
-        return ret;
+        int again = ret == MPP_NOK || ret == MPP_ERR_TIMEOUT;
+        av_log(avctx, again ? AV_LOG_DEBUG : AV_LOG_ERROR,
+               "Failed to get packet from encoder output queue: %d\n", ret);
+        return again ? AVERROR(EAGAIN) : AVERROR_EXTERNAL;
     }
     if (!mpp_pkt)
         return AVERROR(ENOMEM);
+
+    ret = release_input_frame(r->frame_list, mpp_pkt);
 
     if (mpp_packet_get_eos(mpp_pkt)) {
         av_log(avctx, AV_LOG_DEBUG, "Received an EOS packet\n");
@@ -975,6 +961,12 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
         goto exit;
     }
     av_log(avctx, AV_LOG_DEBUG, "Received a packet\n");
+
+    if (ret < 0) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get key input frame from packet meta\n");
+        ret = AVERROR_EXTERNAL;
+        goto exit;
+    }
 
     /* freeing MppPacket data in buffer callbacks is not supported in async mode */
     {
@@ -1009,28 +1001,31 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
                                       (packet->flags & AV_PKT_FLAG_KEY) ?
                                       AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P);
 
-    if ((ret = mpp_meta_get_frame(mpp_meta, KEY_INPUT_FRAME, &mpp_frame)) != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get key input frame from packet meta: %d\n", ret);
-        ret = AVERROR_EXTERNAL;
-        goto exit;
-    }
-
-    mpp_buf = mpp_frame_get_buffer(mpp_frame);
-    if (!mpp_buf) {
-        ret = AVERROR(ENOMEM);
-        goto exit;
-    }
-
-    /* mark buffer as unused (idx < 0) */
-    mpp_buffer_set_index(mpp_buf, -1);
-    clear_unused_frames(r->frame_list);
-
     mpp_packet_deinit(&mpp_pkt);
     return 0;
 
 exit:
     if (mpp_pkt)
         mpp_packet_deinit(&mpp_pkt);
+
+    return ret;
+}
+
+static int rkmpp_wait_packet(AVCodecContext *avctx, AVPacket *packet)
+{
+    int64_t deadline = av_gettime_relative() + ENC_WAIT_TIMEOUT_MS * 1000LL;
+    int64_t left_ms = ENC_WAIT_TIMEOUT_MS;
+    int ret;
+
+    do {
+        ret = rkmpp_get_packet(avctx, packet, FFMAX(left_ms, 1));
+        left_ms = (deadline - av_gettime_relative()) / 1000;
+    } while (ret == AVERROR(EAGAIN) && left_ms > 0);
+
+    if (ret == AVERROR(EAGAIN)) {
+        av_log(avctx, AV_LOG_ERROR, "Timed out waiting for the encoder output\n");
+        ret = AVERROR(ETIMEDOUT);
+    }
 
     return ret;
 }
@@ -1047,7 +1042,8 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    !(avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
                    ? MPP_TIMEOUT_NON_BLOCK : MPP_TIMEOUT_BLOCK;
 
-    if (get_used_frame_count(r->frame_list) > r->async_frames)
+    if (r->eos_sent ||
+        (frame && get_used_frame_count(r->frame_list) > r->async_frames))
         goto get;
 
     mpp_enc_frame = rkmpp_submit_frame(avctx, (AVFrame *)frame);
@@ -1056,17 +1052,16 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
         return AVERROR(ENOMEM);
     }
 
-send:
-    ret = rkmpp_send_frame(avctx, mpp_enc_frame);
-    if (ret == AVERROR(EAGAIN))
-        goto send;
-    else if (ret)
+    while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN))
+        ;
+    if (ret)
         return ret;
+    if (!frame)
+        r->eos_sent = 1;
 
 get:
-    ret = rkmpp_get_packet(avctx, packet, timeout);
-    if (!frame && ret == AVERROR(EAGAIN))
-        goto send;
+    ret = frame ? rkmpp_get_packet(avctx, packet, timeout)
+                : rkmpp_wait_packet(avctx, packet);
     if (ret == AVERROR_EOF ||
         ret == AVERROR(EAGAIN))
         *got_packet = 0;
@@ -1076,6 +1071,21 @@ get:
         *got_packet = 1;
 
     return 0;
+}
+
+/* After a reset every frame still inside MPP sits in a packet on its output list. */
+static void rkmpp_release_output(RKMPPEncContext *r)
+{
+    int timeout = MPP_TIMEOUT_NON_BLOCK;
+    MppPacket mpp_pkt = NULL;
+
+    if (r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout) != MPP_OK)
+        return;
+
+    while (r->mapi->encode_get_packet(r->mctx, &mpp_pkt) == MPP_OK && mpp_pkt) {
+        release_input_frame(r->frame_list, mpp_pkt);
+        mpp_packet_deinit(&mpp_pkt);
+    }
 }
 
 static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
@@ -1092,6 +1102,7 @@ static av_cold int rkmpp_encode_close(AVCodecContext *avctx)
 
     if (r->mapi) {
         r->mapi->reset(r->mctx);
+        rkmpp_release_output(r);
         mpp_destroy(r->mctx);
         r->mctx = NULL;
     }

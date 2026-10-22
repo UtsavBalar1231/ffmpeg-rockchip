@@ -38,11 +38,13 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/time.h"
 #include "libavutil/uuid.h"
 
 #define H26X_HEADER_SIZE   1024
 #define H26X_ASYNC_FRAMES  4
 #define MJPEG_ASYNC_FRAMES 8
+#define ENC_WAIT_TIMEOUT_MS 2000
 #define ALIGN_DOWN(a, b) ((a) & ~((b)-1))
 
 typedef struct MPPEncFrame {
@@ -51,6 +53,7 @@ typedef struct MPPEncFrame {
     MppEncUserDataSet   mpp_sei_set;
     struct MPPEncFrame *next;
     int                 queued;
+    int                 in_mpp;
 } MPPEncFrame;
 
 typedef struct RKMPPEncContext {
@@ -69,6 +72,7 @@ typedef struct RKMPPEncContext {
 
     MPPEncFrame       *frame_list;
     int                async_frames;
+    int                eos_sent;
 
     int                rc_mode;
     int                qp_init;
