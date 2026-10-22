@@ -1055,25 +1055,24 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    !(avctx->flags & AV_CODEC_FLAG_LOW_DELAY)
                    ? MPP_TIMEOUT_NON_BLOCK : MPP_TIMEOUT_BLOCK;
 
-    if (r->eos_sent ||
-        (frame && get_used_frame_count(r->frame_list) > r->async_frames))
-        goto get;
+    if (!r->eos_sent) {
+        if ((ret = rkmpp_submit_frame(avctx, (AVFrame *)frame, &mpp_enc_frame)) < 0)
+            return ret;
 
-    if ((ret = rkmpp_submit_frame(avctx, (AVFrame *)frame, &mpp_enc_frame)) < 0)
-        return ret;
-
-    while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN))
-        ;
-    if (ret) {
-        release_frame(mpp_enc_frame);
-        return ret;
+        while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN))
+            ;
+        if (ret) {
+            release_frame(mpp_enc_frame);
+            return ret;
+        }
+        if (!frame)
+            r->eos_sent = 1;
     }
-    if (!frame)
-        r->eos_sent = 1;
 
-get:
-    ret = frame ? rkmpp_get_packet(avctx, packet, timeout)
-                : rkmpp_wait_packet(avctx, packet);
+    if (!frame || get_used_frame_count(r->frame_list) > r->async_frames)
+        ret = rkmpp_wait_packet(avctx, packet);
+    else
+        ret = rkmpp_get_packet(avctx, packet, timeout);
     if (ret == AVERROR_EOF ||
         ret == AVERROR(EAGAIN))
         *got_packet = 0;
