@@ -193,7 +193,8 @@ release:
 
 static av_cold int set_size_info(AVFilterContext *ctx,
                                  AVFilterLink *inlink,
-                                 AVFilterLink *outlink)
+                                 AVFilterLink *outlink,
+                                 enum AVPixelFormat out_format)
 {
     RGAVppContext *r = ctx->priv;
     double w_adj = 1.0;
@@ -224,6 +225,15 @@ static av_cold int set_size_info(AVFilterContext *ctx,
 
     ff_scale_adjust_dimensions(inlink, &w, &h,
                                r->force_original_aspect_ratio, r->force_divisible_by, w_adj);
+
+    /* RGA writes YUV in 2-aligned rects, an odd last row or column would stay unwritten */
+    if (!(av_pix_fmt_desc_get(out_format)->flags & AV_PIX_FMT_FLAG_RGB) &&
+        ((w & 1) || (h & 1))) {
+        av_log(ctx, AV_LOG_VERBOSE, "Rounding YUV output size %dx%d down to %dx%d\n",
+               w, h, ALIGN_DOWN(w, RK_RGA_YUV_ALIGN), ALIGN_DOWN(h, RK_RGA_YUV_ALIGN));
+        w = ALIGN_DOWN(w, RK_RGA_YUV_ALIGN);
+        h = ALIGN_DOWN(h, RK_RGA_YUV_ALIGN);
+    }
 
     if (((int64_t)h * inlink->w) > INT_MAX ||
         ((int64_t)w * inlink->h) > INT_MAX) {
@@ -371,7 +381,7 @@ static av_cold int rgavpp_config_props(AVFilterLink *outlink)
 
     config_force_format(ctx, in_format, &out_format);
 
-    ret = set_size_info(ctx, inlink, outlink);
+    ret = set_size_info(ctx, inlink, outlink, out_format);
     if (ret < 0)
         return ret;
 
