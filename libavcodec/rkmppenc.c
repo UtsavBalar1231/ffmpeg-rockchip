@@ -937,6 +937,20 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
             goto exit;
     }
 
+    /* request the IDR on this frame, not on whichever MPP dequeues next */
+    if ((avctx->codec_id == AV_CODEC_ID_H264 ||
+         avctx->codec_id == AV_CODEC_ID_HEVC) &&
+        frame->pict_type == AV_PICTURE_TYPE_I) {
+        MppMeta mpp_meta = mpp_frame_get_meta(mpp_frame);
+
+        if (!mpp_meta ||
+            mpp_meta_set_s32(mpp_meta, KEY_INPUT_IDR_REQ, 1) != MPP_OK) {
+            av_log(avctx, AV_LOG_ERROR, "Failed to request an IDR frame\n");
+            ret = AVERROR_EXTERNAL;
+            goto exit;
+        }
+    }
+
     *out = mpp_enc_frame;
     return 0;
 
@@ -954,16 +968,6 @@ static int rkmpp_send_frame(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame)
 
     if (frame && (ret = rkmpp_set_enc_cfg_prep(avctx, frame)) < 0)
         goto exit;
-
-    if ((avctx->codec_id == AV_CODEC_ID_H264 ||
-         avctx->codec_id == AV_CODEC_ID_HEVC) &&
-         frame && frame->pict_type == AV_PICTURE_TYPE_I) {
-        if ((ret = r->mapi->control(r->mctx, MPP_ENC_SET_IDR_FRAME, NULL)) != MPP_OK) {
-            av_log(avctx, AV_LOG_ERROR, "Failed to set IDR frame: %d\n", ret);
-            ret = AVERROR_EXTERNAL;
-            goto exit;
-        }
-    }
 
     if ((ret = r->mapi->encode_put_frame(r->mctx, mpp_frame)) != MPP_OK) {
         int log_level = (ret == MPP_NOK) ? AV_LOG_DEBUG : AV_LOG_ERROR;
