@@ -390,6 +390,11 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
     int mmap_prot;
     void *addr;
 
+    if (desc->drm_desc.objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
+        av_log(hwfc, AV_LOG_ERROR, "Transfer non-linear DRM_PRIME frame is not supported!\n");
+        return AVERROR(ENOSYS);
+    }
+
     map = av_mallocz(sizeof(*map));
     if (!map)
         return AVERROR(ENOMEM);
@@ -407,11 +412,6 @@ static int rkmpp_map_frame(AVHWFramesContext *hwfc,
         map->sync_flags |= DMA_BUF_SYNC_WRITE;
     sync_start.flags = DMA_BUF_SYNC_START | map->sync_flags;
 #endif
-
-    if (desc->drm_desc.objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(hwfc, AV_LOG_ERROR, "Transfer non-linear DRM_PRIME frame is not supported!\n");
-        return AVERROR(ENOSYS);
-    }
 
     av_assert0(desc->drm_desc.nb_objects <= AV_DRM_MAX_PLANES);
     for (i = 0; i < desc->drm_desc.nb_objects; i++) {
