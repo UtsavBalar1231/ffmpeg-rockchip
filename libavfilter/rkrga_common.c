@@ -1210,6 +1210,10 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
 
         r->is_overlay_offset_valid = (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
             (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2);
+        if (!param->in_global_alpha) {
+            av_log(avctx, AV_LOG_VERBOSE, "Overlay alpha is 0, passing the main input through\n");
+            r->is_overlay_offset_valid = 0;
+        }
         if (r->is_overlay_offset_valid)
             init_pat_preproc_hwframes_ctx(avctx);
     }
