@@ -94,6 +94,12 @@ static uint32_t rkmpp_get_av_format(MppFrameFormat mpp_fmt)
     }
 }
 
+static int rkmpp_is_interlaced(int mpp_frame_mode)
+{
+    return (mpp_frame_mode & MPP_FRAME_FLAG_PAIRED_FIELD) ||
+           (mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED;
+}
+
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
                                 int *stride, int reverse)
 {
@@ -294,8 +300,10 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
         }
     }
 
-    if (avctx->skip_frame == AVDISCARD_NONKEY)
+    if (avctx->skip_frame == AVDISCARD_NONKEY && r->deint) {
+        av_log(avctx, AV_LOG_VERBOSE, "Deinterlacing is disabled when skipping non-key frames\n");
         r->deint = 0;
+    }
 
     if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_ENABLE_DEINTERLACE, &r->deint)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to set enable deinterlace: %d\n", ret);
@@ -687,10 +695,12 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         frame->flags |= AV_FRAME_FLAG_CORRUPT;
 
     mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
-    if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED)
+    /* frames out of IEP keep the source field flags but are progressive */
+    if (!(mpp_frame_mode & MPP_FRAME_FLAG_IEP_DEI_MASK) && rkmpp_is_interlaced(mpp_frame_mode)) {
         frame->flags |= AV_FRAME_FLAG_INTERLACED;
-    if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST)
-        frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+        if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST)
+            frame->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
+    }
 
     if (avctx->codec_id == AV_CODEC_ID_MPEG1VIDEO ||
         avctx->codec_id == AV_CODEC_ID_MPEG2VIDEO) {
@@ -916,8 +926,7 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             goto info_change_fail;
 
         /* Disable fast parsing for the interlaced video */
-        if (((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED ||
-             (mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_TOP_FIRST) && fast_parse) {
+        if (rkmpp_is_interlaced(mpp_frame_mode) && fast_parse) {
             av_log(avctx, AV_LOG_VERBOSE, "Fast parsing is disabled for the interlaced video\n");
             fast_parse = 0;
         }
