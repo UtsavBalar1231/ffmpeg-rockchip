@@ -198,6 +198,8 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
                                        AV_PIX_FMT_NV12,
                                        AV_PIX_FMT_NONE };
 
+    r->iep_last_pts = AV_NOPTS_VALUE;
+
     opts_env = getenv("FFMPEG_RKMPP_DEC_OPT");
     if (opts_env && av_set_options_string(r, opts_env, "=", " ") <= 0)
         av_log(avctx, AV_LOG_WARNING, "Unable to set decoder options from env\n");
@@ -587,6 +589,29 @@ static void rkmpp_free_drm_desc(void *opaque, uint8_t *data)
     av_free(drm_desc);
 }
 
+/* IEP turns each interlaced frame into two frames; MPP may give both the
+ * same pts, so move the second one half a frame later */
+static void rkmpp_set_iep_frame_pts(AVCodecContext *avctx, AVFrame *frame, int64_t mpp_pts)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+
+    if (!r->iep_rate_doubled) {
+        AVRational field_rate = { 50, 1 };
+
+        if (avctx->framerate.num > 0 && avctx->framerate.den > 0) {
+            field_rate = av_mul_q(avctx->framerate, (AVRational){ 2, 1 });
+            avctx->framerate = field_rate;
+        }
+        if (avctx->pkt_timebase.num > 0 && avctx->pkt_timebase.den > 0)
+            r->iep_half_duration = FFMAX(av_rescale_q(1, av_inv_q(field_rate), avctx->pkt_timebase), 1);
+        r->iep_rate_doubled = 1;
+    }
+
+    if (mpp_pts == r->iep_last_pts)
+        frame->pts += r->iep_half_duration;
+    r->iep_last_pts = mpp_pts;
+}
+
 static int frame_create_buf(AVFrame *frame,
                             uint8_t* data, int size,
                             void (*free)(void *opaque, uint8_t *data),
@@ -695,6 +720,9 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         frame->flags |= AV_FRAME_FLAG_CORRUPT;
 
     mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
+    if ((mpp_frame_mode & MPP_FRAME_FLAG_IEP_DEI_MASK) == MPP_FRAME_FLAG_IEP_DEI_I4O2)
+        rkmpp_set_iep_frame_pts(avctx, frame, mpp_frame_get_pts(mpp_frame));
+
     /* frames out of IEP keep the source field flags but are progressive */
     if (!(mpp_frame_mode & MPP_FRAME_FLAG_IEP_DEI_MASK) && rkmpp_is_interlaced(mpp_frame_mode)) {
         frame->flags |= AV_FRAME_FLAG_INTERLACED;
@@ -1193,6 +1221,9 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
             if (!(framerate.num && framerate.den)) {
                 framerate.num = 25;
                 framerate.den = 1;
+            } else if (r->iep_rate_doubled) {
+                /* packets still come at the source frame rate */
+                framerate = av_mul_q(framerate, (AVRational){ 1, 2 });
             }
             pts_diff = (avctx->pkt_timebase.den * framerate.den) /
                        (avctx->pkt_timebase.num * framerate.num);
@@ -1335,6 +1366,7 @@ static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
         r->info_change = 0;
         r->got_frame = 0;
         r->mjpeg_in_flight = 0;
+        r->iep_last_pts = AV_NOPTS_VALUE;
 
         av_packet_unref(&r->last_pkt);
     } else

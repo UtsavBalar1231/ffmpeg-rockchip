@@ -65,6 +65,9 @@ typedef struct RKMPPDecContext {
     int            got_frame;
     int            use_rfbc;
     int            mjpeg_in_flight;
+    int            iep_rate_doubled;
+    int64_t        iep_half_duration;
+    int64_t        iep_last_pts;
 
     int            deint;
     int            afbc;
