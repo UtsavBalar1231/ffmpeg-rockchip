@@ -319,7 +319,7 @@ static void set_colorspace_info(RGAFrameInfo *in_info,
         case AVCOL_RANGE_MPEG:
             if (in_spc == AVCOL_SPC_BT709)
                 out_mode = 3 << 0; /* IM_YUV_TO_RGB_BT709_LIMIT */
-            if (in_spc == AVCOL_SPC_BT470BG)
+            if (in_spc == AVCOL_SPC_BT470BG || in_spc == AVCOL_SPC_SMPTE170M)
                 out_mode = 1 << 0; /* IM_YUV_TO_RGB_BT601_LIMIT */
             break;
         case AVCOL_RANGE_JPEG:
