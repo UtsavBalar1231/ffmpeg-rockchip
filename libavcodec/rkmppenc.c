@@ -35,6 +35,11 @@ static const char *const afbc_input_socs[] = {
     "rk3528", "rk3566", "rk3567", "rk3568", "rk3588", NULL,
 };
 
+/* SoCs whose JPEG encoder is VPU720, which takes YUV input only */
+static const char *const jpeg_yuv_only_socs[] = {
+    "rk3572", "rk3576", NULL,
+};
+
 static int rkmpp_soc_is_any(const char *const *socs)
 {
     char compat[512];
@@ -1232,6 +1237,14 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
                av_get_pix_fmt_name(pix_fmt));
         return AVERROR(ENOSYS);
     }
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG &&
+        (av_pix_fmt_desc_get(pix_fmt)->flags & AV_PIX_FMT_FLAG_RGB) &&
+        rkmpp_soc_is_any(jpeg_yuv_only_socs)) {
+        av_log(avctx, AV_LOG_ERROR, "RGB input is not supported by this SoC's JPEG encoder, "
+               "convert it to a YUV format such as nv12 first\n");
+        return AVERROR(ENOSYS);
+    }
+
     r->pix_fmt = pix_fmt;
     r->mpp_fmt = mpp_fmt;
 
