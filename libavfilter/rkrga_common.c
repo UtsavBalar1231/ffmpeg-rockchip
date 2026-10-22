@@ -384,6 +384,14 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
                av_get_pix_fmt_name(in->pix_fmt));
         return AVERROR(ENOSYS);
     }
+    /* RGA2-Pro reads compact 10-bit correctly only from 16-byte aligned offsets */
+    if (r->has_rga2p && r->is_rga2_used && in->crop && in->pix_desc->comp[0].depth >= 10 &&
+        in->act_x % 64) {
+        av_log(avctx, AV_LOG_ERROR, "Cropping 10-bit '%s' input on RGA2-Pro needs an x offset that is "
+               "a multiple of 64, got %d; convert to 8-bit before cropping\n",
+               av_get_pix_fmt_name(in->pix_fmt), in->act_x);
+        return AVERROR(EINVAL);
+    }
     if (r->is_rga2_used && !r->has_rga2p &&
         (out->act_w > 4096 || out->act_h > 4096)) {
         av_log(avctx, AV_LOG_ERROR, "Max supported output size of RGA2 (non-Pro) is 4096x4096\n");
