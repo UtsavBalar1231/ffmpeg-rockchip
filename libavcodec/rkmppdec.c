@@ -677,8 +677,10 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         layer->planes[0].pitch  = mpp_frame_get_hor_stride(mpp_frame);
 
         pix_desc = av_pix_fmt_desc_get(avctx->sw_pix_fmt);
-        if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0)
+        if ((ret = get_afbc_byte_stride(pix_desc, (int *)&layer->planes[0].pitch, 0)) < 0) {
+            av_free(desc);
             return ret;
+        }
 
         /* MPP specific AFBC src_y offset, not memory address offset */
         frame->crop_top = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
@@ -699,12 +701,16 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     }
 
     if ((ret = frame_create_buf(frame, mpp_frame, mpp_frame_get_buf_size(mpp_frame),
-                                rkmpp_free_mpp_frame, mpp_frame, AV_BUFFER_FLAG_READONLY)) < 0)
+                                rkmpp_free_mpp_frame, mpp_frame, AV_BUFFER_FLAG_READONLY)) < 0) {
+        av_free(desc);
         return ret;
+    }
 
     if ((ret = frame_create_buf(frame, (uint8_t *)desc, sizeof(*desc),
-                                rkmpp_free_drm_desc, desc, AV_BUFFER_FLAG_READONLY)) < 0)
+                                rkmpp_free_drm_desc, desc, AV_BUFFER_FLAG_READONLY)) < 0) {
+        av_free(desc);
         return ret;
+    }
 
     frame->data[0] = (uint8_t *)desc;
 
@@ -991,8 +997,14 @@ export:
         switch (avctx->pix_fmt) {
         case AV_PIX_FMT_DRM_PRIME:
             {
-                if ((ret = rkmpp_export_frame(avctx, frame, mpp_frame)) < 0)
+                ret = rkmpp_export_frame(avctx, frame, mpp_frame);
+                /* the frame owns mpp_frame once it holds a buffer */
+                if (frame->buf[0])
+                    mpp_frame = NULL;
+                if (ret < 0) {
+                    av_frame_unref(frame);
                     goto exit;
+                }
                 return 0;
             }
             break;
@@ -1008,8 +1020,13 @@ export:
                     ret = AVERROR(ENOMEM);
                     goto exit;
                 }
-                if ((ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame)) < 0)
+                ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame);
+                if (tmp_frame->buf[0])
+                    mpp_frame = NULL;
+                if (ret < 0) {
+                    av_frame_free(&tmp_frame);
                     goto exit;
+                }
 
                 if ((ret = ff_get_buffer(avctx, frame, 0)) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "ff_get_buffer failed: %d\n", ret);
