@@ -673,6 +673,9 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     frame->height = avctx->height;
     frame->pts    = MPP_PTS_TO_PTS(mpp_frame_get_pts(mpp_frame), avctx->pkt_timebase);
 
+    if (mpp_frame_get_errinfo(mpp_frame))
+        frame->flags |= AV_FRAME_FLAG_CORRUPT;
+
     mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
     if ((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED)
         frame->flags |= AV_FRAME_FLAG_INTERLACED;
@@ -812,19 +815,25 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         ret = AVERROR(EAGAIN);
         goto exit;
     }
-    if (ret = mpp_frame_get_errinfo(mpp_frame)) {
-        int ignore_err = (avctx->codec_id != AV_CODEC_ID_MJPEG) ||
-                         (avctx->err_recognition & AV_EF_IGNORE_ERR);
-        int log_level = ignore_err ? AV_LOG_DEBUG : AV_LOG_ERROR;
+    if ((ret = mpp_frame_get_errinfo(mpp_frame))) {
+        if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
+            int ignore_err = avctx->err_recognition & AV_EF_IGNORE_ERR;
+            int log_level = ignore_err ? AV_LOG_DEBUG : AV_LOG_ERROR;
 
-        av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
-        if (avctx->codec_id == AV_CODEC_ID_MJPEG)
+            av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
             av_log(avctx, log_level, "The YCbCr format may not be supported. Supported: "
                    "YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | YUV444(1*1:1*1:1*1)\n");
-        if (!ignore_err)
-            r->eof = 1; /* bail out from the loop */
-        ret = AVERROR(EAGAIN);
-        goto exit;
+            if (!ignore_err)
+                r->eof = 1; /* bail out from the loop */
+            ret = AVERROR(EAGAIN);
+            goto exit;
+        }
+        if (avctx->err_recognition & AV_EF_EXPLODE) {
+            av_log(avctx, AV_LOG_ERROR, "Received a 'errinfo' frame: %d\n", ret);
+            ret = AVERROR_INVALIDDATA;
+            goto exit;
+        }
+        av_log(avctx, AV_LOG_DEBUG, "Received a 'errinfo' frame: %d, exporting it as corrupt\n", ret);
     }
 
     if (r->info_change = mpp_frame_get_info_change(mpp_frame) ||
@@ -895,11 +904,6 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         if (avctx->codec_id == AV_CODEC_ID_MJPEG)
             goto export;
 
-        /* no more new pkts after EOS, retry to get frame */
-        if (r->draining) {
-            mpp_frame_deinit(&mpp_frame);
-            return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_MAX);
-        }
         ret = AVERROR(EAGAIN);
         goto exit;
     } else {
@@ -1146,6 +1150,19 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
     return 0;
 }
 
+static int rkmpp_drain_frame(AVCodecContext *avctx, AVFrame *frame)
+{
+    int ret;
+
+    /* EAGAIN is not a valid answer while draining, retry until EOS */
+    do {
+        ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_BLOCK);
+    } while (ret == AVERROR(EAGAIN) && avctx->codec_id != AV_CODEC_ID_MJPEG);
+
+    /* the MJPEG decoder sends no EOS frame */
+    return ret == AVERROR(EAGAIN) ? AVERROR_EOF : ret;
+}
+
 static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 {
     RKMPPDecContext *r = avctx->priv_data;
@@ -1159,49 +1176,36 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     if (r->eof)
         return AVERROR_EOF;
 
-    /* drain remain frames */
-    if (r->draining) {
-        ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_BLOCK);
-        goto exit;
-    }
+    if (r->draining)
+        return rkmpp_drain_frame(avctx, frame);
 
     while (1) {
         if (!pkt->size) {
             ret = ff_decode_get_packet(avctx, pkt);
             if (ret == AVERROR_EOF) {
                 av_log(avctx, AV_LOG_DEBUG, "Decoder is at EOF\n");
-                /* send EOS and start draining */
                 rkmpp_send_eos(avctx);
-                ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_BLOCK);
-                goto exit;
+                return rkmpp_drain_frame(avctx, frame);
             } else if (ret == AVERROR(EAGAIN)) {
                 /* not blocking so that we can feed data ASAP */
-                ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_NON_BLOCK);
-                goto exit;
+                return rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_NON_BLOCK);
             } else if (ret < 0) {
                 av_log(avctx, AV_LOG_ERROR, "Decoder failed to get packet: %d\n", ret);
-                goto exit;
+                return ret;
             }
         }
 
         ret = rkmpp_send_packet(avctx, pkt);
         if (ret == AVERROR(EAGAIN)) {
             /* the input queue is full: keep the packet for the next call */
-            ret = rkmpp_get_frame(avctx, frame, 100);
-            goto exit;
+            return rkmpp_get_frame(avctx, frame, 100);
         }
         av_packet_unref(pkt);
         if (ret < 0) {
             av_log(avctx, AV_LOG_ERROR, "Decoder failed to send packet: %d\n", ret);
-            goto exit;
+            return ret;
         }
     }
-
-exit:
-    if (r->draining &&
-        ret == AVERROR(EAGAIN))
-        ret = AVERROR_EOF;
-    return ret;
 }
 
 static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
