@@ -40,6 +40,11 @@ static const char *const jpeg_yuv_only_socs[] = {
     "rk3572", "rk3576", NULL,
 };
 
+/* SoCs whose HEVC encoder (VEPU510) has no intra refresh support */
+static const char *const hevc_no_refresh_socs[] = {
+    "rk3576", NULL,
+};
+
 static int rkmpp_soc_is_any(const char *const *socs)
 {
     char compat[512];
@@ -1242,6 +1247,13 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
         rkmpp_soc_is_any(jpeg_yuv_only_socs)) {
         av_log(avctx, AV_LOG_ERROR, "RGB input is not supported by this SoC's JPEG encoder, "
                "convert it to a YUV format such as nv12 first\n");
+        return AVERROR(ENOSYS);
+    }
+
+    /* MPP would still suppress the periodic IDRs, leaving one IDR for the whole stream */
+    if (avctx->codec_id == AV_CODEC_ID_HEVC && r->intra_refresh &&
+        rkmpp_soc_is_any(hevc_no_refresh_socs)) {
+        av_log(avctx, AV_LOG_ERROR, "Intra refresh is not supported by this SoC's HEVC encoder\n");
         return AVERROR(ENOSYS);
     }
 
