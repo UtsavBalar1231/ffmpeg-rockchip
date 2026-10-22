@@ -34,6 +34,7 @@
 #include "hwconfig.h"
 #include "internal.h"
 
+#include "libavutil/avstring.h"
 #include "libavutil/hwcontext_rkmpp.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -69,6 +70,7 @@ typedef struct RKMPPEncContext {
     int                cfg_init;
     MppFrameFormat     mpp_fmt;
     enum AVPixelFormat pix_fmt;
+    int                afbc_input;
 
     MPPEncFrame       *frame_list;
     int                async_frames;

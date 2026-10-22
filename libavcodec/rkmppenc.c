@@ -27,6 +27,42 @@
 #include "config_components.h"
 #include "rkmppenc.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+/* SoCs whose H.264/HEVC encoder takes AFBC (v2) input, from MPP's SoC table */
+static const char *const afbc_input_socs[] = {
+    "rk3528", "rk3566", "rk3567", "rk3568", "rk3588", NULL,
+};
+
+static int rkmpp_soc_is_any(const char *const *socs)
+{
+    char compat[512];
+    ssize_t len;
+    int fd = open("/proc/device-tree/compatible", O_RDONLY);
+
+    if (fd < 0)
+        return 0;
+    len = read(fd, compat, sizeof(compat) - 1);
+    close(fd);
+    if (len <= 0)
+        return 0;
+    compat[len] = '\0';
+
+    /* a list of NUL-terminated strings, e.g. "vendor,board\0rockchip,rk3576\0" */
+    for (const char *p = compat; p < compat + len; p += strlen(p) + 1) {
+        const char *soc;
+
+        if (!av_strstart(p, "rockchip,", &soc))
+            continue;
+        for (int i = 0; socs[i]; i++)
+            if (av_strstart(soc, socs[i], NULL))
+                return 1;
+    }
+
+    return 0;
+}
+
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
 {
     switch (avctx->codec_id) {
@@ -722,6 +758,7 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     int hor_stride = 0, ver_stride = 0;
     MppBufferInfo buf_info = { 0 };
     MppFrameFormat mpp_fmt = r->mpp_fmt;
+    uint64_t modifier;
     int ret, is_afbc = 0;
 
     MPPEncFrame *mpp_enc_frame = NULL;
@@ -820,18 +857,17 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
     layer = &drm_desc->layers[0];
     plane0 = &layer->planes[0];
 
-    is_afbc = drm_is_afbc(drm_desc->objects[0].format_modifier);
-    if (!is_afbc &&
-        drm_desc->objects[0].format_modifier != DRM_FORMAT_MOD_LINEAR) {
-        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
+    modifier = drm_desc->objects[0].format_modifier;
+    is_afbc = drm_is_afbc(modifier);
+    if (drm_is_rfbc(modifier) || (is_afbc && !r->afbc_input)) {
+        av_log(avctx, AV_LOG_ERROR, "%s compressed input is not supported by this SoC's "
+               "%s encoder, insert scale_rkrga to convert it to linear\n",
+               is_afbc ? "AFBC" : "RFBC", avcodec_get_name(avctx->codec_id));
         ret = AVERROR(ENOSYS);
         goto exit;
     }
-    if (is_afbc &&
-        !(avctx->codec_id == AV_CODEC_ID_H264 ||
-          avctx->codec_id == AV_CODEC_ID_HEVC)) {
-        av_log(avctx, AV_LOG_ERROR, "AFBC is not supported in codec '%s'\n",
-               avcodec_get_name(avctx->codec_id));
+    if (!is_afbc && modifier != DRM_FORMAT_MOD_LINEAR) {
+        av_log(avctx, AV_LOG_ERROR, "Only linear and AFBC modifiers are supported\n");
         ret = AVERROR(ENOSYS);
         goto exit;
     }
@@ -1056,11 +1092,19 @@ static int rkmpp_encode_frame(AVCodecContext *avctx, AVPacket *packet,
                    ? MPP_TIMEOUT_NON_BLOCK : MPP_TIMEOUT_BLOCK;
 
     if (!r->eos_sent) {
+        int64_t deadline = av_gettime_relative() + ENC_WAIT_TIMEOUT_MS * 1000LL;
+
         if ((ret = rkmpp_submit_frame(avctx, (AVFrame *)frame, &mpp_enc_frame)) < 0)
             return ret;
 
-        while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN))
-            ;
+        while ((ret = rkmpp_send_frame(avctx, mpp_enc_frame)) == AVERROR(EAGAIN)) {
+            if (av_gettime_relative() > deadline) {
+                av_log(avctx, AV_LOG_ERROR, "Timed out putting a frame to the encoder\n");
+                ret = AVERROR(ETIMEDOUT);
+                break;
+            }
+            av_usleep(1000);
+        }
         if (ret) {
             release_frame(mpp_enc_frame);
             return ret;
@@ -1186,6 +1230,10 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
     }
     r->pix_fmt = pix_fmt;
     r->mpp_fmt = mpp_fmt;
+
+    r->afbc_input = (avctx->codec_id == AV_CODEC_ID_H264 ||
+                     avctx->codec_id == AV_CODEC_ID_HEVC) &&
+                    rkmpp_soc_is_any(afbc_input_socs);
 
     if ((ret = mpp_check_support_format(MPP_CTX_ENC, coding_type)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "MPP doesn't support encoding codec '%s' (%d)\n",
