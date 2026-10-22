@@ -29,6 +29,9 @@
 #include "config_components.h"
 
 #include "rkmppdec.h"
+#include "bytestream.h"
+
+#include "libavutil/imgutils.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -1031,14 +1034,77 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     return 0;
 }
 
-static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_buf)
+static int rkmpp_mjpeg_parse_size(const uint8_t *data, int size, int *width, int *height)
+{
+    GetByteContext gb;
+
+    bytestream2_init(&gb, data, size);
+    while (bytestream2_get_bytes_left(&gb) >= 4) {
+        int marker, len;
+
+        if (bytestream2_get_byte(&gb) != 0xff)
+            continue;
+        marker = bytestream2_peek_byte(&gb);
+        if (marker < 0xc0 || marker == 0xff)
+            continue;
+        bytestream2_skip(&gb, 1);
+
+        if (marker == 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) /* SOI, RSTn */
+            continue;
+        if (marker == 0xd9 || marker == 0xda) /* EOI, SOS */
+            break;
+
+        len = bytestream2_get_be16(&gb);
+        if (marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
+            bytestream2_skip(&gb, 1); /* sample precision */
+            *height = bytestream2_get_be16(&gb);
+            *width  = bytestream2_get_be16(&gb);
+            return *width > 0 && *height > 0 ? 0 : AVERROR_INVALIDDATA;
+        }
+        if (len < 2)
+            return AVERROR_INVALIDDATA;
+        bytestream2_skip(&gb, len - 2);
+    }
+    return AVERROR_INVALIDDATA;
+}
+
+/* MPP checks the output buffer size only after programming the hardware,
+ * so size it from the frame header rather than the container */
+static int rkmpp_mjpeg_get_buf_size(AVCodecContext *avctx, const AVPacket *pkt, size_t *buf_sz)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+    int width, height;
+
+    if (rkmpp_mjpeg_parse_size(pkt->data, pkt->size, &width, &height) < 0 ||
+        av_image_check_size(width, height, 0, avctx) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "No valid frame size in the JPEG header\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (r->buf_group) {
+        /* the frames context and every exported frame use the configured size */
+        if (width != avctx->width || height != avctx->height) {
+            av_log(avctx, AV_LOG_ERROR, "JPEG size %dx%d differs from the configured %dx%d, "
+                   "reopen the decoder to change the size\n",
+                   width, height, avctx->width, avctx->height);
+            return AVERROR_INVALIDDATA;
+        }
+    } else {
+        width  = FFMAX(width,  avctx->width);
+        height = FFMAX(height, avctx->height);
+    }
+
+    *buf_sz = (size_t)FFALIGN(width, 16) * FFALIGN(height, 16) << 2;
+    return 0;
+}
+
+static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_buf, size_t buf_sz)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppBufferGroup buf_group = r->buf_group ? r->buf_group : r->buf_group_misc;
     MppBuffer mpp_buf = NULL;
     MppFrame mpp_frame = NULL;
     MppMeta pkt_meta = NULL;
-    size_t buf_sz = FFALIGN(avctx->width, 16) * FFALIGN(avctx->height, 16) << 2;
     int ret;
 
     av_assert0(buf_group);
@@ -1129,8 +1195,12 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
         MppBuffer mpp_buf = NULL;
+        size_t frame_buf_sz;
 
         av_assert0(r->buf_group_misc);
+
+        if ((ret = rkmpp_mjpeg_get_buf_size(avctx, pkt, &frame_buf_sz)) < 0)
+            return ret;
 
         /* the input slot of the MJPEG decoder must be a DRM/DMA buffer,
          * so borrow some from the frame buffer to write the pkt data */
@@ -1157,7 +1227,7 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
         mpp_buffer_put(mpp_buf);
         mpp_packet_set_pts(mpp_pkt, mpp_pkt_pts);
 
-        ret = rkmpp_mjpeg_put_packet(avctx, mpp_pkt);
+        ret = rkmpp_mjpeg_put_packet(avctx, mpp_pkt, frame_buf_sz);
     } else {
         if ((ret = mpp_packet_init(&mpp_pkt, pkt->data, pkt->size)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to init packet: %d\n", ret);
