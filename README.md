@@ -1,3 +1,25 @@
+# ffmpeg-rockchip
+
+FFmpeg with Rockchip hardware video through Rockchip MPP and RGA, maintained
+for RK3576.
+
+- `*_rkmpp` decoders. RK3576 runs H.264, HEVC, VP9, AV1 and MJPEG; the
+  H.263, MPEG-1/2/4 and VP8 decoders are kept for older SoCs.
+- `h264_rkmpp`, `hevc_rkmpp` and `mjpeg_rkmpp` encoders.
+- An RKMPP hardware-frames context over DRM PRIME, and the `scale_rkrga`,
+  `vpp_rkrga` and `overlay_rkrga` filters.
+
+Base: FFmpeg `release/9.0`. The Rockchip code is nyanmisaka's ffmpeg-rockchip
+series, imported with her authorship, with fixes on top. Tested on RK3576
+with the vendor 6.1 kernel, MPP 1.1 and librga 1.10; other Rockchip SoCs are
+not tested.
+
+Configure with `--enable-rkmpp --enable-rkrga --enable-libdrm
+--enable-version3`. MPP and librga are Apache-2.0, so the result is
+(L)GPLv3.
+
+---
+
 # FFmpeg README
 
 FFmpeg is a collection of libraries and tools to process multimedia content
