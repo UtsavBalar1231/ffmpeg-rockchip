@@ -467,19 +467,19 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
         mpp_enc_cfg_set_s32(cfg, "prep:format_out", rkmpp_fix_chroma_fmt(r->chroma_fmt, r->pix_fmt));
     }
 
-    if (avctx->framerate.den > 0 && avctx->framerate.num > 0)
+    /* without a frame rate keep MPP's default; the time base is not a rate */
+    if (avctx->framerate.den > 0 && avctx->framerate.num > 0) {
         av_reduce(&fps_num, &fps_den, avctx->framerate.num, avctx->framerate.den, 65535);
-    else
-        av_reduce(&fps_num, &fps_den, avctx->time_base.den, avctx->time_base.num, 65535);
 
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps_num);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", fps_den);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", fps_den);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num",fps_num);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", fps_den);
-    mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", fps_den);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_flex", 0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_num", fps_num);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denom", fps_den);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_in_denorm", fps_den);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_flex", 0);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_num", fps_num);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denom", fps_den);
+        mpp_enc_cfg_set_s32(cfg, "rc:fps_out_denorm", fps_den);
+    }
 
     mpp_enc_cfg_set_s32(cfg, "rc:gop", FFMAX(avctx->gop_size, 1));
 
