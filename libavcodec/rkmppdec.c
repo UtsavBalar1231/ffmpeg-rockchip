@@ -1056,7 +1056,7 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     /* avoid sending new data after EOS */
     if (r->draining)
-        return AVERROR(EOF);
+        return AVERROR_EOF;
 
     /* do not skip non-key pkt until got any frame */
     if (r->got_frame &&
@@ -1117,11 +1117,6 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
         mpp_packet_set_pts(mpp_pkt, mpp_pkt_pts);
 
         ret = rkmpp_mjpeg_put_packet(avctx, mpp_pkt);
-        if (ret == MPP_ERR_UNKNOW) {
-            if (mpp_pkt)
-                mpp_packet_deinit(&mpp_pkt);
-            return AVERROR_EXTERNAL;
-        }
     } else {
         if ((ret = mpp_packet_init(&mpp_pkt, pkt->data, pkt->size)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to init packet: %d\n", ret);
@@ -1133,10 +1128,13 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
     }
 
     if (ret != MPP_OK) {
-        av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
-        if (mpp_pkt)
-            mpp_packet_deinit(&mpp_pkt);
-        return AVERROR(EAGAIN);
+        mpp_packet_deinit(&mpp_pkt);
+        if (ret == MPP_ERR_BUFFER_FULL) {
+            av_log(avctx, AV_LOG_TRACE, "Decoder buffer is full\n");
+            return AVERROR(EAGAIN);
+        }
+        av_log(avctx, AV_LOG_ERROR, "Failed to put packet: %d\n", ret);
+        return AVERROR_EXTERNAL;
     }
     /* update the last pts */
     r->last_pts = pkt->pts == AV_NOPTS_VALUE ? last_pts : pkt->pts;
@@ -1184,21 +1182,18 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
                 av_log(avctx, AV_LOG_ERROR, "Decoder failed to get packet: %d\n", ret);
                 goto exit;
             }
-        } else {
-            /* send pending data to decoder */
-            ret = rkmpp_send_packet(avctx, pkt);
-            if (ret == AVERROR(EAGAIN)) {
-                /* some streams might need more packets to start returning frames */
-                ret = rkmpp_get_frame(avctx, frame, 100);
-                if (ret != AVERROR(EAGAIN))
-                    goto exit;
-            } else if (ret < 0) {
-                av_log(avctx, AV_LOG_ERROR, "Decoder failed to send packet: %d\n", ret);
-                goto exit;
-            } else {
-                av_packet_unref(pkt);
-                pkt->size = 0;
-            }
+        }
+
+        ret = rkmpp_send_packet(avctx, pkt);
+        if (ret == AVERROR(EAGAIN)) {
+            /* the input queue is full: keep the packet for the next call */
+            ret = rkmpp_get_frame(avctx, frame, 100);
+            goto exit;
+        }
+        av_packet_unref(pkt);
+        if (ret < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Decoder failed to send packet: %d\n", ret);
+            goto exit;
         }
     }
 
