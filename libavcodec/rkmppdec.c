@@ -816,16 +816,18 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         goto exit;
     }
     if ((ret = mpp_frame_get_errinfo(mpp_frame))) {
-        if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
-            int ignore_err = avctx->err_recognition & AV_EF_IGNORE_ERR;
-            int log_level = ignore_err ? AV_LOG_DEBUG : AV_LOG_ERROR;
-
-            av_log(avctx, log_level, "Received a 'errinfo' frame: %d\n", ret);
-            av_log(avctx, log_level, "The YCbCr format may not be supported. Supported: "
-                   "YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | YUV444(1*1:1*1:1*1)\n");
-            if (!ignore_err)
-                r->eof = 1; /* bail out from the loop */
-            ret = AVERROR(EAGAIN);
+        /* a JPEG the MPP parser rejected comes back without a size */
+        if (avctx->codec_id == AV_CODEC_ID_MJPEG &&
+            (!mpp_frame_get_width(mpp_frame) || !mpp_frame_get_height(mpp_frame))) {
+            if (avctx->err_recognition & AV_EF_IGNORE_ERR) {
+                av_log(avctx, AV_LOG_DEBUG, "Skipping a JPEG that MPP cannot decode\n");
+                ret = AVERROR(EAGAIN);
+                goto exit;
+            }
+            av_log(avctx, AV_LOG_ERROR, "MPP cannot decode this JPEG. The YCbCr format may not be "
+                   "supported. Supported: YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | "
+                   "YUV444(1*1:1*1:1*1)\n");
+            ret = AVERROR_INVALIDDATA;
             goto exit;
         }
         if (avctx->err_recognition & AV_EF_EXPLODE) {
