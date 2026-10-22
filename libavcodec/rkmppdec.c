@@ -32,6 +32,7 @@
 #include "bytestream.h"
 
 #include "libavutil/imgutils.h"
+#include "libavutil/time.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -163,6 +164,8 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
     r->info_change = 0;
     r->got_frame = 0;
     r->use_rfbc = 0;
+
+    av_packet_unref(&r->last_pkt);
 
     if (r->mapi) {
         r->mapi->reset(r->mctx);
@@ -866,16 +869,16 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
     }
     if (mpp_frame_get_eos(mpp_frame)) {
         av_log(avctx, AV_LOG_DEBUG, "Received a 'EOS' frame\n");
-        /* EOS frame may contain valid data */
+        /* MPP sends nothing after EOS, but this frame may still carry a picture */
+        r->eof = 1;
         if (!mpp_frame_get_buffer(mpp_frame)) {
-            r->eof = 1;
             ret = AVERROR_EOF;
             goto exit;
         }
     }
     if (mpp_frame_get_discard(mpp_frame)) {
         av_log(avctx, AV_LOG_DEBUG, "Received a 'discard' frame\n");
-        ret = AVERROR(EAGAIN);
+        ret = r->eof ? AVERROR_EOF : AVERROR(EAGAIN);
         goto exit;
     }
     if ((ret = mpp_frame_get_errinfo(mpp_frame))) {
@@ -1046,7 +1049,7 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
 {
     RKMPPDecContext *r = avctx->priv_data;
     MppPacket mpp_pkt = NULL;
-    int ret;
+    int i, ret;
 
     /* the MJPEG decoder is 1-in-1-out and has no EOS frame,
      * draining waits for the packets still in flight instead */
@@ -1061,13 +1064,22 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     }
     mpp_packet_set_eos(mpp_pkt);
 
-    do {
+    for (i = 0; i < EOS_PUT_RETRIES; i++) {
         ret = r->mapi->decode_put_packet(r->mctx, mpp_pkt);
-    } while (ret != MPP_OK);
+        if (ret != MPP_ERR_BUFFER_FULL)
+            break;
+        av_usleep(10000);
+    }
+    mpp_packet_deinit(&mpp_pkt);
+
+    if (ret != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to put 'EOS' packet: %d\n", ret);
+        /* without EOS MPP never sends its last frames, so stop here */
+        r->eof = 1;
+        return AVERROR_EXTERNAL;
+    }
 
     r->draining = 1;
-
-    mpp_packet_deinit(&mpp_pkt);
     return 0;
 }
 
@@ -1329,7 +1341,8 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
             ret = ff_decode_get_packet(avctx, pkt);
             if (ret == AVERROR_EOF) {
                 av_log(avctx, AV_LOG_DEBUG, "Decoder is at EOF\n");
-                rkmpp_send_eos(avctx);
+                if ((ret = rkmpp_send_eos(avctx)) < 0)
+                    return ret;
                 return rkmpp_drain_frame(avctx, frame);
             } else if (ret == AVERROR(EAGAIN)) {
                 /* not blocking so that we can feed data ASAP */

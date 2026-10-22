@@ -45,6 +45,7 @@
 
 #define MAX_SOC_NAME_LENGTH 128
 #define MJPEG_DRAIN_TIMEOUT 1000 /* ms */
+#define EOS_PUT_RETRIES     100  /* 10 ms apart */
 
 typedef struct RKMPPDecContext {
     const AVClass *class;
