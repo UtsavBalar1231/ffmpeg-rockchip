@@ -61,6 +61,7 @@ static uint32_t rkmpp_get_drm_format(MppFrameFormat mpp_fmt)
     case MPP_FMT_YUV422SP:          return DRM_FORMAT_NV16;
     case MPP_FMT_YUV422SP_10BIT:    return DRM_FORMAT_NV20;
     case MPP_FMT_YUV444SP:          return DRM_FORMAT_NV24;
+    case MPP_FMT_YUV400:            return DRM_FORMAT_R8;
     default:                        return DRM_FORMAT_INVALID;
     }
 }
@@ -85,6 +86,7 @@ static uint32_t rkmpp_get_av_format(MppFrameFormat mpp_fmt)
     case MPP_FMT_YUV422SP:          return AV_PIX_FMT_NV16;
     case MPP_FMT_YUV422SP_10BIT:    return AV_PIX_FMT_NV20;
     case MPP_FMT_YUV444SP:          return AV_PIX_FMT_NV24;
+    case MPP_FMT_YUV400:            return AV_PIX_FMT_GRAY8;
     default:                        return AV_PIX_FMT_NONE;
     }
 }
@@ -222,6 +224,11 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
         pix_fmts[1] = AV_PIX_FMT_NV24;
         is_fmt_supported =
             avctx->codec_id == AV_CODEC_ID_HEVC ||
+            avctx->codec_id == AV_CODEC_ID_MJPEG;
+        break;
+    case AV_PIX_FMT_GRAY8:
+        pix_fmts[1] = AV_PIX_FMT_GRAY8;
+        is_fmt_supported =
             avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
     case AV_PIX_FMT_NONE: /* fallback to drm_prime */
@@ -476,11 +483,9 @@ attach:
     return 0;
 
 fail:
-    if (r->buf_group &&
-        r->buf_mode == RKMPP_DEC_HALF_INTERNAL) {
-        mpp_buffer_group_put(r->buf_group);
+    /* the half internal group belongs to the frames context */
+    if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL)
         r->buf_group = NULL;
-    }
     av_buffer_unref(&r->hwframe);
     return ret;
 }
@@ -640,16 +645,18 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         frame->crop_top = r->use_rfbc ? 0 : mpp_frame_get_offset_y(mpp_frame);
     } else {
         layer->format = rkmpp_get_drm_format(mpp_fmt);
-        layer->nb_planes = 2;
+        layer->nb_planes = layer->format == DRM_FORMAT_R8 ? 1 : 2;
         layer->planes[0].offset = 0;
         layer->planes[0].pitch  = mpp_frame_get_hor_stride(mpp_frame);
 
-        layer->planes[1].object_index = 0;
-        layer->planes[1].offset = layer->planes[0].pitch * mpp_frame_get_ver_stride(mpp_frame);
-        layer->planes[1].pitch  = layer->planes[0].pitch;
+        if (layer->nb_planes > 1) {
+            layer->planes[1].object_index = 0;
+            layer->planes[1].offset = layer->planes[0].pitch * mpp_frame_get_ver_stride(mpp_frame);
+            layer->planes[1].pitch  = layer->planes[0].pitch;
 
-        if (avctx->sw_pix_fmt == AV_PIX_FMT_NV24)
-            layer->planes[1].pitch <<= 1;
+            if (avctx->sw_pix_fmt == AV_PIX_FMT_NV24)
+                layer->planes[1].pitch <<= 1;
+        }
     }
 
     if ((ret = frame_create_buf(frame, mpp_frame, mpp_frame_get_buf_size(mpp_frame),
@@ -750,6 +757,8 @@ static int rkmpp_mjpeg_get_frame(AVCodecContext *avctx, MppFrame *mpp_frame_out,
         return timeout == MPP_TIMEOUT_BLOCK ? ret : MPP_ERR_TIMEOUT;
 
     if (mpp_frame) {
+        r->mjpeg_in_flight--;
+
         frame_meta = mpp_frame_get_meta(mpp_frame);
         if (frame_meta &&
             (ret = mpp_meta_get_packet(frame_meta, KEY_INPUT_PACKET, &mpp_pkt)) == MPP_OK) {
@@ -772,8 +781,16 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
     if (r->eof)
         return AVERROR_EOF;
 
-    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
-        timeout = FFMAX(timeout, MPP_TIMEOUT_NON_BLOCK);
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
+        if (r->draining) {
+            if (r->mjpeg_in_flight <= 0) {
+                r->eof = 1;
+                return AVERROR_EOF;
+            }
+            timeout = MJPEG_DRAIN_TIMEOUT;
+        } else
+            timeout = FFMAX(timeout, MPP_TIMEOUT_NON_BLOCK);
+    }
 
     if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to set output timeout: %d\n", ret);
@@ -797,6 +814,11 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
     }
 
     if (!mpp_frame) {
+        if (avctx->codec_id == AV_CODEC_ID_MJPEG && r->draining && ret == MPP_ERR_TIMEOUT) {
+            av_log(avctx, AV_LOG_ERROR, "Timed out draining %d MJPEG frames\n", r->mjpeg_in_flight);
+            r->eof = 1;
+            return AVERROR_EXTERNAL;
+        }
         if (timeout != MPP_TIMEOUT_NON_BLOCK)
             av_log(avctx, AV_LOG_DEBUG, "Timeout getting decoded frame\n");
         return AVERROR(EAGAIN);
@@ -856,12 +878,18 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         }
 
         pix_fmts[1] = rkmpp_get_av_format(mpp_fmt & MPP_FRAME_FMT_MASK);
+        if (pix_fmts[1] == AV_PIX_FMT_NONE) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported MPP frame format: 0x%x\n",
+                   mpp_fmt & MPP_FRAME_FMT_MASK);
+            ret = AVERROR(ENOSYS);
+            goto info_change_fail;
+        }
 
         if (avctx->pix_fmt == AV_PIX_FMT_DRM_PRIME)
             avctx->sw_pix_fmt = pix_fmts[1];
         else {
             if ((ret = ff_get_format(avctx, pix_fmts)) < 0)
-                goto exit;
+                goto info_change_fail;
             avctx->pix_fmt = ret;
         }
 
@@ -882,7 +910,7 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
                av_get_pix_fmt_name(avctx->sw_pix_fmt));
 
         if ((ret = rkmpp_set_buffer_group(avctx, pix_fmts[1], avctx->width, avctx->height)) < 0)
-            goto exit;
+            goto info_change_fail;
 
         /* Disable fast parsing for the interlaced video */
         if (((mpp_frame_mode & MPP_FRAME_FLAG_FIELD_ORDER_MASK) == MPP_FRAME_FLAG_DEINTERLACED ||
@@ -893,13 +921,13 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_PARSER_FAST_MODE, &fast_parse)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to set parser fast mode: %d\n", ret);
             ret = AVERROR_EXTERNAL;
-            goto exit;
+            goto info_change_fail;
         }
 
         if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to set info change ready: %d\n", ret);
             ret = AVERROR_EXTERNAL;
-            goto exit;
+            goto info_change_fail;
         }
 
         /* there's no real info change, export the frame directly */
@@ -926,6 +954,7 @@ export:
         case AV_PIX_FMT_NV24:
         case AV_PIX_FMT_NV15:
         case AV_PIX_FMT_NV20:
+        case AV_PIX_FMT_GRAY8:
             {
                 AVFrame *tmp_frame = av_frame_alloc();
                 if (!tmp_frame) {
@@ -963,6 +992,10 @@ export:
         }
     }
 
+info_change_fail:
+    /* MPP stalls until the info change is acked; MJPEG retries on the next picture */
+    if (avctx->codec_id != AV_CODEC_ID_MJPEG)
+        r->eof = 1;
 exit:
     if (mpp_frame)
         mpp_frame_deinit(&mpp_frame);
@@ -975,8 +1008,8 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     MppPacket mpp_pkt = NULL;
     int ret;
 
-    /* unlike other video codecs, MJPEG decoder's I/O is 1-in-1-out,
-     * there's no need to send EOS and drain internally enqueued frames */
+    /* the MJPEG decoder is 1-in-1-out and has no EOS frame,
+     * draining waits for the packets still in flight instead */
     if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
         r->draining = 1;
         return 0;
@@ -1015,13 +1048,15 @@ static int rkmpp_mjpeg_put_packet(AVCodecContext *avctx, MppPacket mpp_pkt_with_
         ret = MPP_ERR_UNKNOW;
         goto fail;
     }
-    if ((ret = mpp_buffer_get(buf_group, &mpp_buf, buf_sz)) != MPP_OK) {
-        av_log(avctx, AV_LOG_ERROR, "Failed to get buffer for frame: %d\n", ret);
-        ret = MPP_ERR_UNKNOW;
-        goto fail;
-    }
-    if (!mpp_buf) {
-        ret = MPP_ERR_UNKNOW;
+    if ((ret = mpp_buffer_get(buf_group, &mpp_buf, buf_sz)) != MPP_OK || !mpp_buf) {
+        /* every frame buffer is held downstream: wait like a full input queue */
+        if (mpp_buffer_group_unused(buf_group) <= 0) {
+            av_log(avctx, AV_LOG_TRACE, "No free buffer for frame\n");
+            ret = MPP_ERR_BUFFER_FULL;
+        } else {
+            av_log(avctx, AV_LOG_ERROR, "Failed to get buffer for frame: %d\n", ret);
+            ret = MPP_ERR_UNKNOW;
+        }
         goto fail;
     }
     mpp_frame_set_buffer(mpp_frame, mpp_buf);
@@ -1147,7 +1182,9 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
 
     av_log(avctx, AV_LOG_DEBUG, "Wrote %d bytes to decoder\n", pkt->size);
 
-    if (mpp_pkt && avctx->codec_id != AV_CODEC_ID_MJPEG)
+    if (avctx->codec_id == AV_CODEC_ID_MJPEG)
+        r->mjpeg_in_flight++;
+    else
         mpp_packet_deinit(&mpp_pkt);
     return 0;
 }
@@ -1159,10 +1196,9 @@ static int rkmpp_drain_frame(AVCodecContext *avctx, AVFrame *frame)
     /* EAGAIN is not a valid answer while draining, retry until EOS */
     do {
         ret = rkmpp_get_frame(avctx, frame, MPP_TIMEOUT_BLOCK);
-    } while (ret == AVERROR(EAGAIN) && avctx->codec_id != AV_CODEC_ID_MJPEG);
+    } while (ret == AVERROR(EAGAIN));
 
-    /* the MJPEG decoder sends no EOS frame */
-    return ret == AVERROR(EAGAIN) ? AVERROR_EOF : ret;
+    return ret;
 }
 
 static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
@@ -1170,9 +1206,6 @@ static int rkmpp_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
     RKMPPDecContext *r = avctx->priv_data;
     AVPacket *pkt = &r->last_pkt;
     int ret;
-
-    if (r->info_change && !r->buf_group)
-        return AVERROR_EOF;
 
     /* no more frames after EOS */
     if (r->eof)
@@ -1222,6 +1255,7 @@ static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
         r->draining = 0;
         r->info_change = 0;
         r->got_frame = 0;
+        r->mjpeg_in_flight = 0;
 
         av_packet_unref(&r->last_pkt);
     } else

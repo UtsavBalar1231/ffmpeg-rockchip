@@ -44,6 +44,7 @@
 #include "libavutil/pixdesc.h"
 
 #define MAX_SOC_NAME_LENGTH 128
+#define MJPEG_DRAIN_TIMEOUT 1000 /* ms */
 
 typedef struct RKMPPDecContext {
     const AVClass *class;
@@ -63,6 +64,7 @@ typedef struct RKMPPDecContext {
     int            info_change;
     int            got_frame;
     int            use_rfbc;
+    int            mjpeg_in_flight;
 
     int            deint;
     int            afbc;
