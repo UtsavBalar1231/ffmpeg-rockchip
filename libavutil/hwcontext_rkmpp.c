@@ -61,7 +61,7 @@ static const struct {
     { AV_PIX_FMT_P010,      DRM_FORMAT_P010,     },
     { AV_PIX_FMT_P210,      DRM_FORMAT_P210,     },
     { AV_PIX_FMT_NV15,      DRM_FORMAT_NV15,     },
-    { AV_PIX_FMT_NV20,      DRM_FORMAT_NV20,     },
+    { AV_PIX_FMT_NV20_PACKED, DRM_FORMAT_NV20,     },
     /* packed YUV */
     { AV_PIX_FMT_YUYV422,   DRM_FORMAT_YUYV,     },
     { AV_PIX_FMT_YVYU422,   DRM_FORMAT_YVYU,     },
@@ -175,7 +175,7 @@ static int rkmpp_get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int
     int linesize;
 
     if (pix_fmt == AV_PIX_FMT_NV15 ||
-        pix_fmt == AV_PIX_FMT_NV20) {
+        pix_fmt == AV_PIX_FMT_NV20_PACKED) {
         const int width_align_256_odds = FFALIGN(width, 256) | 256;
         return FFALIGN(width_align_256_odds * 10 / 8, 64);
     }

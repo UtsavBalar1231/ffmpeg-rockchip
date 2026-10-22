@@ -314,7 +314,7 @@ static av_cold void config_force_format(AVFilterContext *ctx,
 
     if (r->force_yuv == FORCE_YUV_AUTO)
         out_depth = (in_format == AV_PIX_FMT_NV15 ||
-                     in_format == AV_PIX_FMT_NV20) ? 10 : 0;
+                     in_format == AV_PIX_FMT_NV20_PACKED) ? 10 : 0;
     else
         out_depth = (r->force_yuv == FORCE_YUV_8BIT) ? 8 :
                     (r->force_yuv == FORCE_YUV_10BIT) ? 10 : 0;

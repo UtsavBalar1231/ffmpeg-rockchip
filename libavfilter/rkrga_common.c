@@ -62,7 +62,7 @@ typedef struct RGAFormatMap {
     { AV_PIX_FMT_P010,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA3 only */ \
     { AV_PIX_FMT_P210,     RK_FORMAT_YCbCr_422_SP_10B }, /* RGA3 only */ \
     { AV_PIX_FMT_NV15,     RK_FORMAT_YCbCr_420_SP_10B }, /* RGA2 only input, aka P010 compact */ \
-    { AV_PIX_FMT_NV20,     RK_FORMAT_YCbCr_422_SP_10B }, /* RGA2 only input, aka P210 compact */ \
+    { AV_PIX_FMT_NV20_PACKED, RK_FORMAT_YCbCr_422_SP_10B }, /* RGA2 only input, aka P210 compact */ \
     { AV_PIX_FMT_YUYV422,  RK_FORMAT_YUYV_422 }, \
     { AV_PIX_FMT_YVYU422,  RK_FORMAT_YVYU_422 }, \
     { AV_PIX_FMT_UYVY422,  RK_FORMAT_UYVY_422 },
@@ -163,7 +163,7 @@ static uint32_t get_drm_afbc_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_NV12:     return DRM_FORMAT_YUV420_8BIT;
     case AV_PIX_FMT_NV15:     return DRM_FORMAT_YUV420_10BIT;
     case AV_PIX_FMT_NV16:     return DRM_FORMAT_YUYV;
-    case AV_PIX_FMT_NV20:     return DRM_FORMAT_Y210;
+    case AV_PIX_FMT_NV20_PACKED: return DRM_FORMAT_Y210;
     case AV_PIX_FMT_NV24:     return DRM_FORMAT_VUY888;
     case AV_PIX_FMT_RGB565LE: return DRM_FORMAT_RGB565;
     case AV_PIX_FMT_BGR565LE: return DRM_FORMAT_BGR565;
@@ -183,7 +183,7 @@ static uint32_t get_drm_rfbc_format(enum AVPixelFormat pix_fmt)
     case AV_PIX_FMT_NV12:     return DRM_FORMAT_YUV420_8BIT;
     case AV_PIX_FMT_NV15:     return DRM_FORMAT_YUV420_10BIT;
     case AV_PIX_FMT_NV16:     return DRM_FORMAT_YUYV;
-    case AV_PIX_FMT_NV20:     return DRM_FORMAT_Y210;
+    case AV_PIX_FMT_NV20_PACKED: return DRM_FORMAT_Y210;
     case AV_PIX_FMT_NV24:     return DRM_FORMAT_VUY888;
     default:                  return DRM_FORMAT_INVALID;
     }
@@ -382,7 +382,7 @@ static int verify_rga_frame_info_io_dynamic(AVFilterContext *avctx,
     }
     if (r->is_rga2_used &&
         (out->pix_fmt == AV_PIX_FMT_NV15 ||
-         out->pix_fmt == AV_PIX_FMT_NV20)) {
+         out->pix_fmt == AV_PIX_FMT_NV20_PACKED)) {
         av_log(avctx, AV_LOG_ERROR, "'%s' as output is not supported if RGA2 is requested\n",
                av_get_pix_fmt_name(out->pix_fmt));
         return AVERROR(ENOSYS);

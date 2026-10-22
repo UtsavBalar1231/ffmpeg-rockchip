@@ -2104,7 +2104,7 @@ av_cold void ff_sws_init_input_funcs(SwsInternal *c,
         *chrToYV12 = read_xv48be_UV_c;
         break;
     case AV_PIX_FMT_NV15:
-    case AV_PIX_FMT_NV20:
+    case AV_PIX_FMT_NV20_PACKED:
         *chrToYV12 = nv15_20ToUV_c;
         break;
     case AV_PIX_FMT_NV20LE:
@@ -2715,7 +2715,7 @@ av_cold void ff_sws_init_input_funcs(SwsInternal *c,
         *lumToYV12 = bgr64LEToY_c;
         break;
     case AV_PIX_FMT_NV15:
-    case AV_PIX_FMT_NV20:
+    case AV_PIX_FMT_NV20_PACKED:
         *lumToYV12 = nv15_20ToY_c;
         break;
     case AV_PIX_FMT_NV20LE:

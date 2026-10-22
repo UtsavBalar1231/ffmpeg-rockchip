@@ -3279,8 +3279,8 @@ static const AVPixFmtDescriptor av_pix_fmt_descriptors[AV_PIX_FMT_NB] = {
         },
         .flags = AV_PIX_FMT_FLAG_PLANAR | AV_PIX_FMT_FLAG_BITSTREAM,
     },
-    [AV_PIX_FMT_NV20] = {
-        .name = "nv20",
+    [AV_PIX_FMT_NV20_PACKED] = {
+        .name = "nv20_packed",
         .nb_components = 3,
         .log2_chroma_w = 1,
         .log2_chroma_h = 0,

@@ -2497,7 +2497,7 @@ void ff_get_unscaled_swscale(SwsInternal *c)
           dstFormat == AV_PIX_FMT_YUV420P12 ||
           dstFormat == AV_PIX_FMT_YUV420P14 ||
           dstFormat == AV_PIX_FMT_YUV420P16)) ||
-        (srcFormat == AV_PIX_FMT_NV20 &&
+        (srcFormat == AV_PIX_FMT_NV20_PACKED &&
          (dstFormat == AV_PIX_FMT_YUV422P10 ||
           dstFormat == AV_PIX_FMT_YUV422P12 ||
           dstFormat == AV_PIX_FMT_YUV422P14 ||

@@ -88,7 +88,7 @@ static uint32_t rkmpp_get_av_format(MppFrameFormat mpp_fmt)
     case MPP_FMT_YUV420SP:          return AV_PIX_FMT_NV12;
     case MPP_FMT_YUV420SP_10BIT:    return AV_PIX_FMT_NV15;
     case MPP_FMT_YUV422SP:          return AV_PIX_FMT_NV16;
-    case MPP_FMT_YUV422SP_10BIT:    return AV_PIX_FMT_NV20;
+    case MPP_FMT_YUV422SP_10BIT:    return AV_PIX_FMT_NV20_PACKED;
     case MPP_FMT_YUV444SP:          return AV_PIX_FMT_NV24;
     case MPP_FMT_YUV400:            return AV_PIX_FMT_GRAY8;
     default:                        return AV_PIX_FMT_NONE;
@@ -229,7 +229,7 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
             avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
     case AV_PIX_FMT_YUV422P10:
-        pix_fmts[1] = AV_PIX_FMT_NV20;
+        pix_fmts[1] = AV_PIX_FMT_NV20_PACKED;
         is_fmt_supported =
             avctx->codec_id == AV_CODEC_ID_H264;
         break;
@@ -996,7 +996,7 @@ export:
         case AV_PIX_FMT_NV16:
         case AV_PIX_FMT_NV24:
         case AV_PIX_FMT_NV15:
-        case AV_PIX_FMT_NV20:
+        case AV_PIX_FMT_NV20_PACKED:
         case AV_PIX_FMT_GRAY8:
             {
                 AVFrame *tmp_frame = av_frame_alloc();
