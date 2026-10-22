@@ -1337,13 +1337,11 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
-        if (filter_ret < 0) {
-            av_frame_free(&aframe.dst->frame);
-            return filter_ret;
-        }
-        aframe.dst->queued--;
-        r->got_frame = 1;
         aframe.dst->frame = NULL;
+        aframe.dst->queued--;
+        if (filter_ret < 0)
+            return filter_ret;
+        r->got_frame = 1;
     }
 
     if (!picref_src)
@@ -1434,13 +1432,11 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         set_rga_async_frame_lock_status(&aframe, 0);
 
         filter_ret = r->filter_frame(outlink, aframe.dst->frame);
-        if (filter_ret < 0) {
-            av_frame_free(&aframe.dst->frame);
-            return filter_ret;
-        }
-        aframe.dst->queued--;
-        r->got_frame = 1;
         aframe.dst->frame = NULL;
+        aframe.dst->queued--;
+        if (filter_ret < 0)
+            return filter_ret;
+        r->got_frame = 1;
     }
 
     return 0;
