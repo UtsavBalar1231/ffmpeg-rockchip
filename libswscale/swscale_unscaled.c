@@ -270,6 +270,13 @@ static int nv24ToYuv420Wrapper(SwsInternal *c, const uint8_t *const src[],
     return srcSliceH;
 }
 
+/* Sample idx of a row of 10-bit samples packed LSB first, 4 samples in 5 bytes. */
+static av_always_inline unsigned packed10_sample(const uint8_t *row, int idx)
+{
+    int bit = idx * 10;
+    return (AV_RL16(row + (bit >> 3)) >> (bit & 7)) & 0x3FF;
+}
+
 static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src8[],
                                   const int srcStride[], int srcSliceY,
                                   int srcSliceH, uint8_t *const dstParam[],
@@ -304,11 +311,13 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src8[],
             *tdstY++ = (((tsrcY[4] & 0xFF) << 2) | ((tsrcY[3] >> 6) & 0x3 )) << shift[0];
             tsrcY += 5;
         }
+        for (x = c->opts.src_w & ~3; x < c->opts.src_w; x++)
+            *tdstY++ = packed10_sample(src[0], x) << shift[0];
         src[0] += srcStride[0];
         dstY += dstStride[0] / sizeof(uint16_t);
     }
 
-    for (y = srcSliceH / vsub; y > 0; y--) {
+    for (y = AV_CEIL_RSHIFT(srcSliceH, dst_format->log2_chroma_h); y > 0; y--) {
         const uint8_t *tsrcUV = src[1];
         uint16_t *tdstU = dstU, *tdstV = dstV;
         for (x = c->chrSrcW / 2; x > 0; x--) {
@@ -317,6 +326,10 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src8[],
             *tdstU++ = (((tsrcUV[3] & 0x3F) << 4) | ((tsrcUV[2] >> 4) & 0xF )) << shift[1];
             *tdstV++ = (((tsrcUV[4] & 0xFF) << 2) | ((tsrcUV[3] >> 6) & 0x3 )) << shift[2];
             tsrcUV += 5;
+        }
+        for (x = c->chrSrcW & ~1; x < c->chrSrcW; x++) {
+            *tdstU++ = packed10_sample(src[1], 2 * x)     << shift[1];
+            *tdstV++ = packed10_sample(src[1], 2 * x + 1) << shift[2];
         }
         src[1] += srcStride[1];
         dstU += dstStride[1] / sizeof(uint16_t);
