@@ -97,6 +97,7 @@ typedef struct RKRGAContext {
     int has_rga3;
     int is_rga2_used;
     int is_overlay_offset_valid;
+    int bt2020_warned;
 
     int eof;
     int got_frame;

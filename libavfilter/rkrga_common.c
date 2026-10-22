@@ -684,6 +684,14 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                 out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
                                 &info.color_space_mode, is_rga2_used);
         }
+
+        if (!r->bt2020_warned &&
+            (in->colorspace == AVCOL_SPC_BT2020_NCL || in->colorspace == AVCOL_SPC_BT2020_CL) &&
+            !(in0_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) &&
+            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+            av_log(ctx, AV_LOG_WARNING, "BT.2020 input is converted to RGB with BT.601 coefficients\n");
+            r->bt2020_warned = 1;
+        }
     }
 
     if (pat_preproc) {
