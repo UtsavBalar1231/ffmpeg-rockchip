@@ -513,8 +513,10 @@ static int rkmpp_transfer_data_from(AVHWFramesContext *hwfc,
     if (err)
         goto fail;
 
-    map->width  = dst->width;
-    map->height = dst->height;
+    /* dst may have the frames context size, which can be taller than the
+     * decoder buffer: HEVC frames are not padded to 16 rows */
+    map->width  = FFMIN(dst->width,  src->width);
+    map->height = FFMIN(dst->height, src->height);
 
     err = av_frame_copy(dst, map);
     if (err)
