@@ -73,26 +73,30 @@ static int rkmpp_soc_is_any(const char *const *socs)
     return 0;
 }
 
+/*
+ * MPP's color tables end before FFmpeg's (at ICtCp, JEDEC P22 and HLG), and
+ * one value past them makes MPP reject or drop the whole color config,
+ * range included.
+ */
 static enum AVColorSpace rkmpp_normalize_colorspace(enum AVColorSpace value)
 {
-    return value == AVCOL_SPC_UNSPECIFIED ||
-           value == AVCOL_SPC_RESERVED ||
-           (unsigned)value >= AVCOL_SPC_NB ? AVCOL_SPC_BT709 : value;
+    return value == AVCOL_SPC_RESERVED || !av_color_space_name(value) ||
+           (int)value > MPP_FRAME_SPC_ICTCP ? AVCOL_SPC_UNSPECIFIED : value;
 }
 
 static enum AVColorPrimaries rkmpp_normalize_color_primaries(enum AVColorPrimaries value)
 {
-    return value == AVCOL_PRI_UNSPECIFIED ||
-           value == AVCOL_PRI_RESERVED ||
-           (unsigned)value >= AVCOL_PRI_NB ? AVCOL_PRI_BT709 : value;
+    return value == AVCOL_PRI_RESERVED0 || value == AVCOL_PRI_RESERVED ||
+           !av_color_primaries_name(value) ||
+           (int)value > MPP_FRAME_PRI_JEDEC_P22 ? AVCOL_PRI_UNSPECIFIED : value;
 }
 
 static enum AVColorTransferCharacteristic rkmpp_normalize_color_trc(
     enum AVColorTransferCharacteristic value)
 {
-    return value == AVCOL_TRC_UNSPECIFIED ||
-           value == AVCOL_TRC_RESERVED ||
-           (unsigned)value >= AVCOL_TRC_NB ? AVCOL_TRC_BT709 : value;
+    return value == AVCOL_TRC_RESERVED0 || value == AVCOL_TRC_RESERVED ||
+           !av_color_transfer_name(value) ||
+           (int)value > MPP_FRAME_TRC_ARIB_STD_B67 ? AVCOL_TRC_UNSPECIFIED : value;
 }
 
 static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
