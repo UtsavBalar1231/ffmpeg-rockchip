@@ -396,17 +396,17 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
                                   int width, int height)
 {
     RKMPPDecContext *r = avctx->priv_data;
+    AVBufferRef *hwframe = NULL;
     AVHWFramesContext *hwfc = NULL;
     AVRKMPPFramesContext *rkmpp_fc = NULL;
+    MppBufferGroup buf_group = NULL;
     int i, ret, decoder_pool_size;
 
     if (!r->hwdevice)
         return AVERROR(ENOMEM);
 
-    av_buffer_unref(&r->hwframe);
-
-    r->hwframe = av_hwframe_ctx_alloc(r->hwdevice);
-    if (!r->hwframe)
+    hwframe = av_hwframe_ctx_alloc(r->hwdevice);
+    if (!hwframe)
         return AVERROR(ENOMEM);
 
     switch (avctx->codec_id) {
@@ -419,7 +419,7 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
         break;
     }
 
-    hwfc = (AVHWFramesContext *)r->hwframe->data;
+    hwfc = (AVHWFramesContext *)hwframe->data;
     hwfc->format    = AV_PIX_FMT_DRM_PRIME;
     hwfc->sw_format = pix_fmt;
     hwfc->width     = FFALIGN(width,  16);
@@ -429,12 +429,12 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
     rkmpp_fc->flags |= MPP_BUFFER_FLAGS_CACHABLE;
 
     if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL) {
-        if ((ret = av_hwframe_ctx_init(r->hwframe)) < 0) {
+        if ((ret = av_hwframe_ctx_init(hwframe)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Failed to init RKMPP frame pool\n");
             goto fail;
         }
 
-        r->buf_group = rkmpp_fc->buf_group;
+        buf_group = rkmpp_fc->buf_group;
         goto attach;
     } else if (r->buf_mode != RKMPP_DEC_PURE_EXTERNAL) {
         ret = AVERROR(EINVAL);
@@ -445,7 +445,7 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
     if (avctx->extra_hw_frames > 0)
         hwfc->initial_pool_size += avctx->extra_hw_frames;
 
-    if ((ret = av_hwframe_ctx_init(r->hwframe)) < 0) {
+    if ((ret = av_hwframe_ctx_init(hwframe)) < 0) {
         av_log(avctx, AV_LOG_ERROR, "Failed to init RKMPP frame pool\n");
         goto fail;
     }
@@ -463,6 +463,7 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
             goto fail;
         }
     }
+    buf_group = r->buf_group;
 
     for (i = 0; i < hwfc->initial_pool_size; i++) {
         AVRKMPPFramesContext *rkmpp_fc = hwfc->hwctx;
@@ -474,7 +475,7 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
             .size  = rkmpp_fc->frames[i].drm_desc.objects[0].size,
         };
 
-        if ((ret = mpp_buffer_commit(r->buf_group, &buf_info)) != MPP_OK) {
+        if ((ret = mpp_buffer_commit(buf_group, &buf_info)) != MPP_OK) {
             av_log(avctx, AV_LOG_ERROR, "Failed to commit external buffer group: %d\n", ret);
             ret = AVERROR_EXTERNAL;
             goto fail;
@@ -482,11 +483,17 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
     }
 
 attach:
-    if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_EXT_BUF_GROUP, r->buf_group)) != MPP_OK) {
+    if ((ret = r->mapi->control(r->mctx, MPP_DEC_SET_EXT_BUF_GROUP, buf_group)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "Failed to attach external buffer group: %d\n", ret);
         ret = AVERROR_EXTERNAL;
         goto fail;
     }
+
+    /* in half internal mode the old frames context owns the group MPP had,
+     * and attaching a new group still writes to the old one */
+    av_buffer_unref(&r->hwframe);
+    r->hwframe   = hwframe;
+    r->buf_group = buf_group;
 
     if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL) {
         int group_limit = decoder_pool_size + ((width * height > (3840 * 2160 * 3)) ? 2 : 10);
@@ -499,10 +506,7 @@ attach:
     return 0;
 
 fail:
-    /* the half internal group belongs to the frames context */
-    if (r->buf_mode == RKMPP_DEC_HALF_INTERNAL)
-        r->buf_group = NULL;
-    av_buffer_unref(&r->hwframe);
+    av_buffer_unref(&hwframe);
     return ret;
 }
 
