@@ -1233,13 +1233,11 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
 
-        /* IM_ALPHA_BLEND_DST_OVER */
-        if (param->in_global_alpha > 0 && param->in_global_alpha < 0xff) {
-            r->in_rga_frame_infos[0].blend_mode = need_premultiply ? (0x4 | (1 << 12)) : 0x4;
-            r->in_rga_frame_infos[0].blend_mode |= (param->in_global_alpha & 0xff) << 16; /* fg_global_alpha */
-            r->in_rga_frame_infos[0].blend_mode |= 0xff << 24;                            /* bg_global_alpha */
-        } else
-            r->in_rga_frame_infos[0].blend_mode = need_premultiply ? 0x504 : 0x501;
+        /* "DST over SRC": the overlay (src1) is drawn over the main input (src0) */
+        r->in_rga_frame_infos[0].blend_mode = IM_ALPHA_BLEND_DST_OVER;
+        if (need_premultiply)
+            r->in_rga_frame_infos[0].blend_mode |= IM_ALPHA_BLEND_PRE_MUL;
+        in1_info->global_alpha = param->in_global_alpha;
 
         /* Crop the part of the overlay that lies left of or above the main input */
         if (param->overlay_x < 0) {
@@ -1381,7 +1379,7 @@ static int get_im_transform(int rotate_mode)
     return usage;
 }
 
-static rga_buffer_t info_to_im_buffer(const rga_info_t *info, int global_alpha)
+static rga_buffer_t info_to_im_buffer(const rga_info_t *info)
 {
     rga_buffer_t buf = wrapbuffer_fd_t(info->fd,
                                        info->rect.xoffset + info->rect.width,
@@ -1391,7 +1389,6 @@ static rga_buffer_t info_to_im_buffer(const rga_info_t *info, int global_alpha)
 
     buf.rd_mode          = info->rd_mode;
     buf.color_space_mode = info->color_space_mode;
-    buf.global_alpha     = (global_alpha > 0) ? global_alpha : 0xff;
 
     return buf;
 }
@@ -1431,31 +1428,21 @@ static int call_rkrga_blit(AVFilterContext *avctx,
     PRINT_RGA_INFO(avctx, pat_info, "pat");
 #undef PRINT_RGA_INFO
 
-    src_buf = info_to_im_buffer(src_info, 0);
-    dst_buf = info_to_im_buffer(dst_info, 0);
+    src_buf = info_to_im_buffer(src_info);
+    dst_buf = info_to_im_buffer(dst_info);
     srect   = info_to_im_rect(src_info);
     drect   = info_to_im_rect(dst_info);
 
     usage |= get_im_transform(src_info->rotation);
 
-    if (src_info->blend) {
-        /* IM_ALPHA_BLEND_DST_OVER: pat (srcB) over src (srcA) */
-        usage |= IM_ALPHA_BLEND_DST_OVER;
-
-        /* legacy bit 12: the pat alpha is straight and needs premultiplying;
-         * without it the pat is already premultiplied */
-        if (!(src_info->blend & (1 << 12)))
-            usage |= IM_ALPHA_BLEND_PRE_MUL;
-    }
-
     if (pat_info) {
-        const int fg_alpha = (src_info->blend >> 16) & 0xff;
-        const int bg_alpha = (src_info->blend >> 24) & 0xff;
+        const RKRGAContext *r = avctx->priv;
 
-        pat_buf = info_to_im_buffer(pat_info, fg_alpha);
-        if (bg_alpha > 0)
-            src_buf.global_alpha = bg_alpha;
-        prect = info_to_im_rect(pat_info);
+        usage  |= src_info->blend;
+        /* im2d passes src.global_alpha as the fg alpha, as c_RkRgaBlit did with blend bits 16-23 */
+        src_buf.global_alpha = r->in_rga_frame_infos[1].global_alpha;
+        pat_buf = info_to_im_buffer(pat_info);
+        prect   = info_to_im_rect(pat_info);
     }
 
     opt.priority = dst_info->priority;

@@ -62,6 +62,7 @@ typedef struct RGAFrameInfo {
     int                       act_h;
     int                       rotate_mode;
     int                       blend_mode;
+    int                       global_alpha;
     int                       crop;
     int                       scheduler_core;
     int                       overlay_x;
