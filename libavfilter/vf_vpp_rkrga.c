@@ -261,7 +261,8 @@ static av_cold int set_size_info(AVFilterContext *ctx,
     if (r->transpose >= 0) {
         switch (r->transpose) {
         case TRANSPOSE_CCLOCK_FLIP:
-            r->in_rotate_mode = 0x07 | (0x01 << 4); /* HAL_TRANSFORM_ROT_270 | (HAL_TRANSFORM_FLIP_H << 4) */
+            /* RGA mirrors the rotated picture: ROT_90 then FLIP_H is a transpose */
+            r->in_rotate_mode = 0x04 | (0x01 << 4); /* HAL_TRANSFORM_ROT_90 | (HAL_TRANSFORM_FLIP_H << 4) */
             FFSWAP(int, outlink->w, outlink->h);
             FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
@@ -276,7 +277,7 @@ static av_cold int set_size_info(AVFilterContext *ctx,
             FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
         case TRANSPOSE_CLOCK_FLIP:
-            r->in_rotate_mode = 0x04 | (0x01 << 4); /* HAL_TRANSFORM_ROT_90 | (HAL_TRANSFORM_FLIP_H << 4) */
+            r->in_rotate_mode = 0x07 | (0x01 << 4); /* HAL_TRANSFORM_ROT_270 | (HAL_TRANSFORM_FLIP_H << 4) */
             FFSWAP(int, outlink->w, outlink->h);
             FFSWAP(int, outlink->sample_aspect_ratio.num, outlink->sample_aspect_ratio.den);
             break;
