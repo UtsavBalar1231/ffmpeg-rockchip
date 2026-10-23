@@ -63,9 +63,19 @@ endconst
         strh            w12, [\dst], #2
 .endm
 
+// void ff_nv15_20ToY_neon(uint8_t *dst, const uint8_t *src,
+//                         const uint8_t *unused1, const uint8_t *unused2,
+//                         int width, uint32_t *pal, void *opq)
+function ff_nv15_20ToY_neon, export=1
+        mov             w2,  w4
+        mov             w3,  #0
+        b               1f
+endfunc
+
 // void ff_packed10_to_y_neon(uint16_t *dst, const uint8_t *src,
 //                            int width, int shift)
 function ff_packed10_to_y_neon, export=1
+1:
         packed10_load_tbl
         dup             v7.8h, w3
         subs            w2,  w2,  #16
@@ -88,10 +98,22 @@ function ff_packed10_to_y_neon, export=1
         ret
 endfunc
 
+// void ff_nv15_20ToUV_neon(uint8_t *dstU, uint8_t *dstV,
+//                          const uint8_t *unused0, const uint8_t *src1,
+//                          const uint8_t *src2, int width,
+//                          uint32_t *pal, void *opq)
+function ff_nv15_20ToUV_neon, export=1
+        mov             x2,  x3
+        mov             w3,  w5
+        mov             w4,  #0
+        b               1f
+endfunc
+
 // void ff_packed10_to_uv_neon(uint16_t *dstU, uint16_t *dstV,
 //                             const uint8_t *src, int width, int shift)
 // width is the number of U/V pairs.
 function ff_packed10_to_uv_neon, export=1
+1:
         packed10_load_tbl
         dup             v7.8h, w4
         subs            w3,  w3,  #8

@@ -294,6 +294,12 @@ NEON_INPUT(rgba32);
 NEON_INPUT_DOTPROD(bgra32);
 NEON_INPUT_DOTPROD(rgba32);
 
+void ff_nv15_20ToY_neon(uint8_t *dst, const uint8_t *src, const uint8_t *,
+                        const uint8_t *, int w, uint32_t *, void *);
+void ff_nv15_20ToUV_neon(uint8_t *dstU, uint8_t *dstV, const uint8_t *,
+                         const uint8_t *src, const uint8_t *, int w,
+                         uint32_t *, void *);
+
 void ff_lumRangeFromJpeg8_neon(int16_t *dst, int width,
                                uint32_t coeff, int64_t offset);
 void ff_chrRangeFromJpeg8_neon(int16_t *dstU, int16_t *dstV, int width,
@@ -428,6 +434,11 @@ av_cold void ff_sws_init_swscale_aarch64(SwsInternal *c)
                 c->chrToYV12 = ff_rgba32ToUV_half_neon;
             else
                 c->chrToYV12 = ff_rgba32ToUV_neon;
+            break;
+        case AV_PIX_FMT_NV15:
+        case AV_PIX_FMT_NV20_PACKED:
+            c->lumToYV12 = ff_nv15_20ToY_neon;
+            c->chrToYV12 = ff_nv15_20ToUV_neon;
             break;
         default:
             break;
