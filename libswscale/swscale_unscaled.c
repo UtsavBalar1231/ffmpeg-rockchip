@@ -285,7 +285,7 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src8[],
     const AVPixFmtDescriptor *src_format = av_pix_fmt_desc_get(c->opts.src_format);
     const AVPixFmtDescriptor *dst_format = av_pix_fmt_desc_get(c->opts.dst_format);
     int vsub = 1 << dst_format->log2_chroma_h;
-    const uint8_t **src = (const uint8_t**)src8;
+    const uint8_t *src[2] = { src8[0], src8[1] };
     uint16_t *dstY = (uint16_t*)(dstParam[0] + dstStride[0] * srcSliceY);
     uint16_t *dstU = (uint16_t*)(dstParam[1] + dstStride[1] * srcSliceY / vsub);
     uint16_t *dstV = (uint16_t*)(dstParam[2] + dstStride[2] * srcSliceY / vsub);
