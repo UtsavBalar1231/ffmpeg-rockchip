@@ -269,8 +269,7 @@ static void set_colorspace_info(RGAFrameInfo *in_info,
                                 RGAFrameInfo *out_info,
                                 enum AVColorSpace *out_spc,
                                 enum AVColorRange *out_rng,
-                                int *color_space_mode,
-                                int is_rga2_used)
+                                int *color_space_mode)
 {
     int rgb_in, rgb_out, out_mode = 0;
 
@@ -301,8 +300,7 @@ static void set_colorspace_info(RGAFrameInfo *in_info,
                     *out_spc = AVCOL_SPC_BT709;
                 if (out_rng)
                     *out_rng = AVCOL_RANGE_MPEG;
-                out_mode = is_rga2_used ? (0xb << 8) /* rgb2yuv_709_limit */
-                                        : (3 << 2);  /* IM_RGB_TO_YUV_BT709_LIMIT */
+                out_mode = IM_RGB_TO_YUV_BT709_LIMIT;
             }
         } else {
             /* The hardware default is IM_RGB_TO_YUV_BT601_LIMIT */
@@ -659,8 +657,6 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     info.sync_mode    = RGA_BLIT_ASYNC;
 
     if (!pat_preproc) {
-        int is_rga2_used = r->is_rga2_used || out_info->scheduler_core == (out_info->scheduler_core & 0xc);
-
 #ifdef RGA_NORMAL_DST_FULL_CSC_FIXUP
         if (in1_info && picref_pat) {
             enum AVColorSpace pat_colorspace = picref_pat->colorspace;
@@ -668,17 +664,17 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
             /* yuv2rgb src->pat */
             set_colorspace_info(in0_info, in->colorspace, in->color_range,
                                 in1_info, &pat_colorspace, &pat_color_range,
-                                &info.color_space_mode, is_rga2_used);
+                                &info.color_space_mode);
             /* rgb2yuv pat->dst */
             set_colorspace_info(in1_info, pat_colorspace, pat_color_range,
                                 out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                &info.color_space_mode, is_rga2_used);
+                                &info.color_space_mode);
         } else
 #endif
         {
             set_colorspace_info(in0_info, in->colorspace, in->color_range,
                                 out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                &info.color_space_mode, is_rga2_used);
+                                &info.color_space_mode);
         }
 
         if (!r->bt2020_warned &&
