@@ -170,6 +170,8 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
     r->use_rfbc = 0;
 
     av_packet_unref(&r->last_pkt);
+    for (int i = 0; i < PKT_PROPS_SLOTS; i++)
+        av_packet_free(&r->pkt_props[i].pkt);
 
     if (r->mapi) {
         r->mapi->reset(r->mctx);
@@ -206,6 +208,8 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
                                        AV_PIX_FMT_NONE };
 
     r->iep_last_pts = AV_NOPTS_VALUE;
+    for (int i = 0; i < PKT_PROPS_SLOTS; i++)
+        r->pkt_props[i].mpp_pts = AV_NOPTS_VALUE;
 
     opts_env = getenv("FFMPEG_RKMPP_DEC_OPT");
     if (opts_env && av_set_options_string(r, opts_env, "=", " ") <= 0)
@@ -529,12 +533,12 @@ static int rkmpp_export_mastering_display(AVCodecContext *avctx, AVFrame *frame,
                                           MppFrameMasteringDisplayMetadata mpp_mastering)
 {
     AVMasteringDisplayMetadata *mastering = NULL;
-    AVFrameSideData *sd = NULL;
     int mapping[3] = { 0, 1, 2 };
     int chroma_den = 0;
     int max_luma_den = 0;
     int min_luma_den = 0;
-    int i;
+    int has_primaries = 0;
+    int i, ret;
 
     switch (avctx->codec_id) {
         case AV_CODEC_ID_HEVC:
@@ -555,43 +559,50 @@ static int rkmpp_export_mastering_display(AVCodecContext *avctx, AVFrame *frame,
             return 0;
     }
 
-    sd = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
-    if (sd)
-        mastering = (AVMasteringDisplayMetadata *)sd->data;
-    else
-        mastering = av_mastering_display_metadata_create_side_data(frame);
-    if (!mastering)
-        return AVERROR(ENOMEM);
+    /* the fields stay zero until the stream has carried the metadata */
+    for (i = 0; i < 3; i++)
+        has_primaries |= mpp_mastering.display_primaries[i][0] |
+                         mpp_mastering.display_primaries[i][1];
+    has_primaries |= mpp_mastering.white_point[0] | mpp_mastering.white_point[1];
+    if (!has_primaries && !mpp_mastering.max_luminance)
+        return 0;
 
-    for (i = 0; i < 3; i++) {
-        const int j = mapping[i];
-        mastering->display_primaries[i][0] = av_make_q(mpp_mastering.display_primaries[j][0], chroma_den);
-        mastering->display_primaries[i][1] = av_make_q(mpp_mastering.display_primaries[j][1], chroma_den);
+    ret = ff_decode_mastering_display_new(avctx, frame, &mastering);
+    if (ret < 0 || !mastering)
+        return ret;
+
+    if (has_primaries) {
+        for (i = 0; i < 3; i++) {
+            const int j = mapping[i];
+            mastering->display_primaries[i][0] = av_make_q(mpp_mastering.display_primaries[j][0], chroma_den);
+            mastering->display_primaries[i][1] = av_make_q(mpp_mastering.display_primaries[j][1], chroma_den);
+        }
+        mastering->white_point[0] = av_make_q(mpp_mastering.white_point[0], chroma_den);
+        mastering->white_point[1] = av_make_q(mpp_mastering.white_point[1], chroma_den);
+        mastering->has_primaries = 1;
     }
-    mastering->white_point[0] = av_make_q(mpp_mastering.white_point[0], chroma_den);
-    mastering->white_point[1] = av_make_q(mpp_mastering.white_point[1], chroma_den);
 
-    mastering->max_luminance = av_make_q(mpp_mastering.max_luminance, max_luma_den);
-    mastering->min_luminance = av_make_q(mpp_mastering.min_luminance, min_luma_den);
-
-    mastering->has_luminance = 1;
-    mastering->has_primaries = 1;
+    if (mpp_mastering.max_luminance) {
+        mastering->max_luminance = av_make_q(mpp_mastering.max_luminance, max_luma_den);
+        mastering->min_luminance = av_make_q(mpp_mastering.min_luminance, min_luma_den);
+        mastering->has_luminance = 1;
+    }
 
     return 0;
 }
 
-static int rkmpp_export_content_light(AVFrame *frame,
+static int rkmpp_export_content_light(AVCodecContext *avctx, AVFrame *frame,
                                       MppFrameContentLightMetadata mpp_light)
 {
     AVContentLightMetadata *light = NULL;
+    int ret;
 
-    AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
-    if (sd)
-        light = (AVContentLightMetadata *)sd->data;
-    else
-        light = av_content_light_metadata_create_side_data(frame);
-    if (!light)
-        return AVERROR(ENOMEM);
+    if (!mpp_light.MaxCLL && !mpp_light.MaxFALL)
+        return 0;
+
+    ret = ff_decode_content_light_new(avctx, frame, &light);
+    if (ret < 0 || !light)
+        return ret;
 
     light->MaxCLL  = mpp_light.MaxCLL;
     light->MaxFALL = mpp_light.MaxFALL;
@@ -673,6 +684,42 @@ static void rkmpp_set_iep_frame_pts(AVCodecContext *avctx, AVFrame *frame, int64
     if (mpp_pts == r->iep_last_pts)
         frame->pts += r->iep_half_duration;
     r->iep_last_pts = mpp_pts;
+    frame->duration = r->iep_half_duration;
+}
+
+/* MPP returns only the pts with a frame, so keep the properties of each
+ * packet sent, keyed by that pts, to give them to the frame it produced */
+static int rkmpp_save_packet_props(AVCodecContext *avctx, const AVPacket *pkt, int64_t mpp_pts)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+    RKMPPPacketProps *p = &r->pkt_props[r->pkt_props_next];
+    int ret;
+
+    if (!p->pkt && !(p->pkt = av_packet_alloc()))
+        return AVERROR(ENOMEM);
+
+    av_packet_unref(p->pkt);
+    p->mpp_pts = AV_NOPTS_VALUE;
+    if ((ret = av_packet_copy_props(p->pkt, pkt)) < 0)
+        return ret;
+
+    p->mpp_pts = mpp_pts;
+    r->pkt_props_next = (r->pkt_props_next + 1) % PKT_PROPS_SLOTS;
+    return 0;
+}
+
+static const AVPacket *rkmpp_find_packet_props(RKMPPDecContext *r, int64_t mpp_pts)
+{
+    if (mpp_pts == AV_NOPTS_VALUE)
+        return NULL;
+
+    /* newest first, a pts may repeat after a seek */
+    for (int i = 1; i <= PKT_PROPS_SLOTS; i++) {
+        const RKMPPPacketProps *p = &r->pkt_props[(r->pkt_props_next - i + PKT_PROPS_SLOTS) % PKT_PROPS_SLOTS];
+        if (p->mpp_pts == mpp_pts)
+            return p->pkt;
+    }
+    return NULL;
 }
 
 static int frame_create_buf(AVFrame *frame,
@@ -697,6 +744,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     AVRKMPPDRMFrameDescriptor *desc = NULL;
     AVDRMLayerDescriptor *layer = NULL;
     const AVPixFmtDescriptor *pix_desc;
+    const AVPacket *pkt;
     MppBuffer mpp_buf = NULL;
     MppFrameFormat mpp_fmt = MPP_FMT_BUTT;
     int mpp_frame_mode = 0;
@@ -781,9 +829,14 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
     if ((ret = ff_decode_frame_props(avctx, frame)) < 0)
         return ret;
 
+    pkt = rkmpp_find_packet_props(r, mpp_frame_get_pts(mpp_frame));
+    if (pkt && (ret = ff_decode_frame_props_from_pkt(avctx, frame, pkt)) < 0)
+        return ret;
+
     frame->width  = avctx->width;
     frame->height = avctx->height;
-    frame->pts    = MPP_PTS_TO_PTS(mpp_frame_get_pts(mpp_frame), avctx->pkt_timebase);
+    if (!pkt || pkt->pts == AV_NOPTS_VALUE)
+        frame->pts = MPP_PTS_TO_PTS(mpp_frame_get_pts(mpp_frame), avctx->pkt_timebase);
 
     if (mpp_frame_get_errinfo(mpp_frame))
         frame->flags |= AV_FRAME_FLAG_CORRUPT;
@@ -813,7 +866,7 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
         ret = rkmpp_export_mastering_display(avctx, frame, mpp_frame_get_mastering_display(mpp_frame));
         if (ret < 0)
             return ret;
-        ret = rkmpp_export_content_light(frame, mpp_frame_get_content_light(mpp_frame));
+        ret = rkmpp_export_content_light(avctx, frame, mpp_frame_get_content_light(mpp_frame));
         if (ret < 0)
             return ret;
     }
@@ -1090,6 +1143,10 @@ export:
                     ret = AVERROR(ENOMEM);
                     goto exit;
                 }
+                /* keep what the caller set up, e.g. the key flag of intra-only codecs */
+                tmp_frame->pict_type = frame->pict_type;
+                tmp_frame->flags     = frame->flags;
+
                 ret = rkmpp_export_frame(avctx, tmp_frame, mpp_frame);
                 if (tmp_frame->buf[0])
                     mpp_frame = NULL;
@@ -1108,6 +1165,9 @@ export:
                     av_frame_free(&tmp_frame);
                     goto exit;
                 }
+                /* ff_get_buffer() attached the stream side data tmp_frame already
+                 * carries, and av_frame_copy_props() appends rather than replaces */
+                av_frame_side_data_free(&frame->side_data, &frame->nb_side_data);
                 if ((ret = av_frame_copy_props(frame, tmp_frame)) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "av_frame_copy_props failed: %d\n", ret);
                     av_frame_free(&tmp_frame);
@@ -1442,7 +1502,8 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
         r->mjpeg_in_flight++;
     else
         mpp_packet_deinit(&mpp_pkt);
-    return 0;
+
+    return rkmpp_save_packet_props(avctx, pkt, mpp_pkt_pts);
 }
 
 static int rkmpp_drain_frame(AVCodecContext *avctx, AVFrame *frame)
@@ -1522,6 +1583,11 @@ static av_cold void rkmpp_decode_flush(AVCodecContext *avctx)
         r->got_frame = 0;
         r->mjpeg_in_flight = 0;
         r->iep_last_pts = AV_NOPTS_VALUE;
+        for (int i = 0; i < PKT_PROPS_SLOTS; i++) {
+            r->pkt_props[i].mpp_pts = AV_NOPTS_VALUE;
+            if (r->pkt_props[i].pkt)
+                av_packet_unref(r->pkt_props[i].pkt);
+        }
 
         av_packet_unref(&r->last_pkt);
     } else

@@ -48,6 +48,12 @@
 #define MJPEG_DRAIN_TIMEOUT 1000 /* ms */
 #define QUEUE_FULL_TIMEOUT  1000 /* ms */
 #define EOS_PUT_RETRIES     100  /* 10 ms apart */
+#define PKT_PROPS_SLOTS     64   /* packets MPP may hold before their frame comes out */
+
+typedef struct RKMPPPacketProps {
+    int64_t        mpp_pts;
+    AVPacket      *pkt;
+} RKMPPPacketProps;
 
 typedef struct RKMPPDecContext {
     const AVClass *class;
@@ -73,6 +79,8 @@ typedef struct RKMPPDecContext {
     int            iep_rate_doubled;
     int64_t        iep_half_duration;
     int64_t        iep_last_pts;
+    RKMPPPacketProps pkt_props[PKT_PROPS_SLOTS];
+    int            pkt_props_next;
 
     int            deint;
     int            afbc;
