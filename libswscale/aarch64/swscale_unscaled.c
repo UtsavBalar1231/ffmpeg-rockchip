@@ -175,6 +175,37 @@ static int nv15_20_to_planar_neon_wrapper(SwsInternal *c, const uint8_t *const s
     return srcSliceH;
 }
 
+static int nv15_20_to_p01x_neon_wrapper(SwsInternal *c, const uint8_t *const src[],
+                                        const int srcStride[], int srcSliceY, int srcSliceH,
+                                        uint8_t *const dst[], const int dstStride[])
+{
+    const AVPixFmtDescriptor *src_desc = av_pix_fmt_desc_get(c->opts.src_format);
+    const AVPixFmtDescriptor *dst_desc = av_pix_fmt_desc_get(c->opts.dst_format);
+    int vsub = 1 << dst_desc->log2_chroma_h;
+    const uint8_t *srcY = src[0], *srcUV = src[1];
+    uint8_t *dstY  = dst[0] + dstStride[0] * srcSliceY;
+    uint8_t *dstUV = dst[1] + dstStride[1] * srcSliceY / vsub;
+    int shift_y  = dst_desc->comp[0].depth + dst_desc->comp[0].shift -
+                   src_desc->comp[0].depth - src_desc->comp[0].shift;
+    int shift_uv = dst_desc->comp[1].depth + dst_desc->comp[1].shift -
+                   src_desc->comp[1].depth - src_desc->comp[1].shift;
+
+    for (int y = 0; y < srcSliceH; y++) {
+        ff_packed10_to_y_neon((uint16_t *)dstY, srcY, c->opts.src_w, shift_y);
+        srcY += srcStride[0];
+        dstY += dstStride[0];
+    }
+
+    /* Interleaved UV unpacks like a luma row of twice the chroma width. */
+    for (int y = 0; y < AV_CEIL_RSHIFT(srcSliceH, dst_desc->log2_chroma_h); y++) {
+        ff_packed10_to_y_neon((uint16_t *)dstUV, srcUV, 2 * c->chrSrcW, shift_uv);
+        srcUV += srcStride[1];
+        dstUV += dstStride[1];
+    }
+
+    return srcSliceH;
+}
+
 /* We need a 16 pixel width alignment. This constraint can easily be removed
  * for input reading but for the output which is 4-bytes per pixel (RGBA) the
  * assembly might be writing as much as 4*15=60 extra bytes at the end of the
@@ -253,6 +284,12 @@ static void get_unscaled_swscale_neon(SwsInternal *c) {
           c->opts.dst_format == AV_PIX_FMT_YUV422P14 ||
           c->opts.dst_format == AV_PIX_FMT_YUV422P16)))
         c->convert_unscaled = nv15_20_to_planar_neon_wrapper;
+
+    if ((c->opts.src_format == AV_PIX_FMT_NV15 &&
+         c->opts.dst_format == AV_PIX_FMT_P010LE) ||
+        (c->opts.src_format == AV_PIX_FMT_NV20_PACKED &&
+         c->opts.dst_format == AV_PIX_FMT_P210LE))
+        c->convert_unscaled = nv15_20_to_p01x_neon_wrapper;
 }
 
 void ff_get_unscaled_swscale_aarch64(SwsInternal *c)

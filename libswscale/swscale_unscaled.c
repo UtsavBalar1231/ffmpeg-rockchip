@@ -339,6 +339,56 @@ static int nv15_20ToPlanarWrapper(SwsInternal *c, const uint8_t *const src8[],
     return srcSliceH;
 }
 
+/* Unpack n samples of a packed 10-bit row into little-endian 16-bit words. */
+static void packed10_row_to_p01x(uint8_t *dst, const uint8_t *row, int n, int shift)
+{
+    const uint8_t *src = row;
+    int x;
+
+    for (x = 0; x < (n & ~3); x += 4, src += 5, dst += 8) {
+        AV_WL16(dst + 0, (((src[1] & 0x3 ) << 8) | (src[0]        & 0xFF)) << shift);
+        AV_WL16(dst + 2, (((src[2] & 0xF ) << 6) | ((src[1] >> 2) & 0x3F)) << shift);
+        AV_WL16(dst + 4, (((src[3] & 0x3F) << 4) | ((src[2] >> 4) & 0xF )) << shift);
+        AV_WL16(dst + 6, (((src[4] & 0xFF) << 2) | ((src[3] >> 6) & 0x3 )) << shift);
+    }
+    for (; x < n; x++, dst += 2)
+        AV_WL16(dst, packed10_sample(row, x) << shift);
+}
+
+/* UV stays interleaved, so chroma rows unpack like luma rows of twice the width. */
+static int nv15_20ToP01xWrapper(SwsInternal *c, const uint8_t *const src[],
+                                const int srcStride[], int srcSliceY,
+                                int srcSliceH, uint8_t *const dstParam[],
+                                const int dstStride[])
+{
+    const AVPixFmtDescriptor *src_format = av_pix_fmt_desc_get(c->opts.src_format);
+    const AVPixFmtDescriptor *dst_format = av_pix_fmt_desc_get(c->opts.dst_format);
+    int vsub = 1 << dst_format->log2_chroma_h;
+    const uint8_t *srcY  = src[0];
+    const uint8_t *srcUV = src[1];
+    uint8_t *dstY  = dstParam[0] + dstStride[0] * srcSliceY;
+    uint8_t *dstUV = dstParam[1] + dstStride[1] * srcSliceY / vsub;
+    const int shift_y  = dst_format->comp[0].depth + dst_format->comp[0].shift -
+                         src_format->comp[0].depth - src_format->comp[0].shift;
+    const int shift_uv = dst_format->comp[1].depth + dst_format->comp[1].shift -
+                         src_format->comp[1].depth - src_format->comp[1].shift;
+    int y;
+
+    for (y = 0; y < srcSliceH; y++) {
+        packed10_row_to_p01x(dstY, srcY, c->opts.src_w, shift_y);
+        srcY += srcStride[0];
+        dstY += dstStride[0];
+    }
+
+    for (y = AV_CEIL_RSHIFT(srcSliceH, dst_format->log2_chroma_h); y > 0; y--) {
+        packed10_row_to_p01x(dstUV, srcUV, 2 * c->chrSrcW, shift_uv);
+        srcUV += srcStride[1];
+        dstUV += dstStride[1];
+    }
+
+    return srcSliceH;
+}
+
 static int planarToP01xWrapper(SwsInternal *c, const uint8_t *const src8[],
                                const int srcStride[], int srcSliceY,
                                int srcSliceH, uint8_t *const dstParam8[],
@@ -2504,6 +2554,10 @@ void ff_get_unscaled_swscale(SwsInternal *c)
           dstFormat == AV_PIX_FMT_YUV422P16))) {
         c->convert_unscaled = nv15_20ToPlanarWrapper;
     }
+    /* nv15_to_p010le & nv20_to_p210le */
+    if ((srcFormat == AV_PIX_FMT_NV15 && dstFormat == AV_PIX_FMT_P010LE) ||
+        (srcFormat == AV_PIX_FMT_NV20_PACKED && dstFormat == AV_PIX_FMT_P210LE))
+        c->convert_unscaled = nv15_20ToP01xWrapper;
     /* yuv2bgr */
     if ((srcFormat == AV_PIX_FMT_YUV420P || srcFormat == AV_PIX_FMT_YUV422P ||
          srcFormat == AV_PIX_FMT_YUVA420P) && isAnyRGB(dstFormat) &&
