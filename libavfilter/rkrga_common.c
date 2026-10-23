@@ -501,6 +501,13 @@ static RGAFrame *submit_frame(RKRGAContext *r, AVFilterLink *inlink,
         return NULL;
     }
 
+    /* RGA2-Pro reads RFBC64x4 but not AFBC16x16; the job would fail in the driver */
+    if (is_afbc && r->has_rga2p && (r->is_rga2_used || out_info->scheduler_core == 0x4)) {
+        av_log(ctx, AV_LOG_ERROR, "Input format '%s' with AFBC16x16 modifier is not supported by RGA2-Pro\n",
+               av_get_pix_fmt_name(in_info->pix_fmt));
+        return NULL;
+    }
+
     /* verify inputs pixel stride */
     if (out_info->scheduler_core > 0 &&
         out_info->scheduler_core == (out_info->scheduler_core & 0x3)) {
