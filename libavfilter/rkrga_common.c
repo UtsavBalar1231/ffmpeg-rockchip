@@ -263,6 +263,21 @@ static RGAFrame *get_free_frame(RGAFrame **list)
     return out;
 }
 
+static int is_full_range_yuv(const RGAFrameInfo *info, enum AVColorRange rng)
+{
+    return rng == AVCOL_RANGE_JPEG ||
+           info->pix_fmt == AV_PIX_FMT_YUVJ420P ||
+           info->pix_fmt == AV_PIX_FMT_YUVJ422P;
+}
+
+/* RGA has BT.601 limited and full and BT.709 limited YUV to RGB, and nothing else */
+static int get_yuv2rgb_mode(enum AVColorSpace spc, int full)
+{
+    if (full)
+        return IM_YUV_TO_RGB_BT601_FULL;
+    return spc == AVCOL_SPC_BT709 ? IM_YUV_TO_RGB_BT709_LIMIT : IM_YUV_TO_RGB_BT601_LIMIT;
+}
+
 static void set_colorspace_info(RGAFrameInfo *in_info,
                                 enum AVColorSpace in_spc,
                                 enum AVColorRange in_rng,
@@ -315,28 +330,11 @@ static void set_colorspace_info(RGAFrameInfo *in_info,
     /* yuv2rgb */
     else if (!rgb_in && rgb_out) {
         /* yuv full/limit -> rgb full */
-        switch (in_rng) {
-        case AVCOL_RANGE_MPEG:
-            if (in_spc == AVCOL_SPC_BT709)
-                out_mode = 3 << 0; /* IM_YUV_TO_RGB_BT709_LIMIT */
-            if (in_spc == AVCOL_SPC_BT470BG || in_spc == AVCOL_SPC_SMPTE170M)
-                out_mode = 1 << 0; /* IM_YUV_TO_RGB_BT601_LIMIT */
-            break;
-        case AVCOL_RANGE_JPEG:
-#if 0
-            if (in_spc == AVCOL_SPC_BT709)
-                out_mode = 0xc << 8; /* yuv2rgb_709_full */
-            if (in_spc == AVCOL_SPC_BT470BG)
-#endif
-                out_mode = 2 << 0; /* IM_YUV_TO_RGB_BT601_FULL */
-            break;
-        }
+        *color_space_mode |= get_yuv2rgb_mode(in_spc, is_full_range_yuv(in_info, in_rng));
         if (out_spc)
             *out_spc = AVCOL_SPC_RGB;
         if (out_rng)
             *out_rng = AVCOL_RANGE_JPEG;
-        if (out_mode)
-            *color_space_mode |= out_mode;
     }
     /* passthrough */
     else {
