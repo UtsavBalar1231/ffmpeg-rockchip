@@ -647,6 +647,11 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
     case AV_CODEC_ID_H264:
         {
             avctx->profile = r->profile;
+            /* 4:0:0 needs chroma_format_idc, which only High and above carry */
+            if (r->pix_fmt == AV_PIX_FMT_GRAY8 && avctx->profile != AV_PROFILE_H264_HIGH) {
+                av_log(avctx, AV_LOG_WARNING, "Monochrome input needs the High profile, using it\n");
+                avctx->profile = AV_PROFILE_H264_HIGH;
+            }
             avctx->level = r->level;
             mpp_enc_cfg_set_s32(cfg, "h264:profile", avctx->profile);
             mpp_enc_cfg_set_s32(cfg, "h264:level", avctx->level);
