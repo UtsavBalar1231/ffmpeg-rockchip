@@ -34,9 +34,8 @@
 #include "libavutil/imgutils.h"
 #include "libavutil/time.h"
 
-#include "libavutil/hdr_dynamic_metadata.h"
-#if CONFIG_HEVC_SEI
-#include "dynamic_hdr_vivid.h"
+#if CONFIG_ITUT_T35
+#include "itut35.h"
 #endif
 
 #include <fcntl.h>
@@ -600,58 +599,46 @@ static int rkmpp_export_content_light(AVFrame *frame,
     return 0;
 }
 
+#if CONFIG_ITUT_T35
 static int rkmpp_export_dynamic_hdr(AVCodecContext *avctx, AVFrame *frame,
                                     MppFrame mpp_frame)
 {
     MppFrameHdrDynamicMeta *meta = mpp_frame_get_hdr_dynamic_meta(mpp_frame);
+    FFITUTT35 itut_t35 = { 0 };
     int ret;
 
     if (!meta || !meta->size)
         return 0;
 
+    /* MPP strips the T.35 header up to the application identifier for
+     * HDR10+ and up to the provider oriented code for HDR Vivid, which is
+     * where the payload parsers start */
     switch (meta->hdr_fmt) {
-    case HDR10PLUS: {
-        AVDynamicHDRPlus *hdrplus = av_dynamic_hdr_plus_create_side_data(frame);
-        if (!hdrplus)
-            return AVERROR(ENOMEM);
+    case HDR10PLUS:
+        itut_t35.country_code           = ITU_T_T35_COUNTRY_CODE_US;
+        itut_t35.provider_code          = ITU_T_T35_PROVIDER_CODE_SAMSUNG;
+        itut_t35.provider_oriented_code = 0x0001;
+        break;
+    case HDRVIVID:
+        itut_t35.country_code           = ITU_T_T35_COUNTRY_CODE_CN;
+        itut_t35.provider_code          = ITU_T_T35_PROVIDER_CODE_HDR_VIVID;
+        itut_t35.provider_oriented_code = 0x0005;
+        break;
+    default: /* Dolby Vision RPUs are not exported */
+        return 0;
+    }
+    itut_t35.payload      = meta->data;
+    itut_t35.payload_size = meta->size;
 
-        /* The MPP payload starts from the application mode byte, which is
-         * exactly what the T.35 parser expects */
-        ret = av_dynamic_hdr_plus_from_t35(hdrplus, meta->data, meta->size);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_DEBUG, "Failed to parse HDR10+ metadata: %d\n", ret);
-            av_frame_remove_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_PLUS);
-        }
-        break;
-    }
-#if CONFIG_HEVC_SEI
-    case HDRVIVID: {
-        AVDynamicHDRVivid *vivid = av_dynamic_hdr_vivid_create_side_data(frame);
-        if (!vivid)
-            return AVERROR(ENOMEM);
-
-        /* The MPP payload starts from the CUVA system start code */
-        ret = ff_parse_itu_t_t35_to_dynamic_hdr_vivid(vivid, meta->data, meta->size);
-        if (ret < 0) {
-            av_log(avctx, AV_LOG_DEBUG, "Failed to parse HDR Vivid metadata: %d\n", ret);
-            av_frame_remove_side_data(frame, AV_FRAME_DATA_DYNAMIC_HDR_VIVID);
-        }
-        break;
-    }
-#endif
-    case HDR10:
-    case HLG:
-        /* static only, nothing to export here */
-        break;
-    case DLBY:
-    default:
-        av_log(avctx, AV_LOG_VERBOSE, "Unsupported dynamic HDR format: %u\n",
-               (unsigned)meta->hdr_fmt);
-        break;
-    }
+    ret = ff_itut_t35_parse_payload_to_frame(&itut_t35, NULL, avctx, frame);
+    if (ret == AVERROR(ENOMEM))
+        return ret;
+    if (ret < 0)
+        av_log(avctx, AV_LOG_DEBUG, "Failed to parse dynamic HDR metadata: %d\n", ret);
 
     return 0;
 }
+#endif
 
 static void rkmpp_free_mpp_frame(void *opaque, uint8_t *data)
 {
@@ -831,12 +818,14 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
             return ret;
     }
 
+#if CONFIG_ITUT_T35
     if (avctx->codec_id == AV_CODEC_ID_HEVC ||
         avctx->codec_id == AV_CODEC_ID_AV1) {
         ret = rkmpp_export_dynamic_hdr(avctx, frame, mpp_frame);
         if (ret < 0)
             return ret;
     }
+#endif
 
     return 0;
 }
