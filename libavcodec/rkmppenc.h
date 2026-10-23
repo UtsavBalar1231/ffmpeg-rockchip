@@ -68,6 +68,9 @@ typedef struct RKMPPEncContext {
 
     MppEncCfg          mcfg;
     int                cfg_init;
+    int                cfg_afbc;
+    int                hor_stride;
+    int                ver_stride;
     MppFrameFormat     mpp_fmt;
     enum AVPixelFormat pix_fmt;
     int                afbc_input;

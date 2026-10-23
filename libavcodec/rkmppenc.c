@@ -233,12 +233,49 @@ static int get_byte_stride(const AVDRMObjectDescriptor *object,
     plane0 = &layer->planes[0];
     plane1 = &layer->planes[1];
 
+    if (plane0->pitch <= 0 || plane0->pitch > INT_MAX)
+        return AVERROR(EINVAL);
+
     *hs = plane0->pitch;
     *vs = is_packed_fmt ?
         ALIGN_DOWN(object->size / plane0->pitch, is_rgb ? 1 : 2) :
         (plane1->offset / plane0->pitch);
 
     return (*hs > 0 && *vs > 0) ? 0 : AVERROR(EINVAL);
+}
+
+/* MPP imports one buffer and locates the chroma planes from the strides alone. */
+static int check_drm_layout(const AVDRMFrameDescriptor *desc,
+                            enum AVPixelFormat pix_fmt, int hs, int vs)
+{
+    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(pix_fmt);
+    const AVDRMLayerDescriptor *layer = &desc->layers[0];
+    const int nb_planes = av_pix_fmt_count_planes(pix_fmt);
+    ptrdiff_t c_pitch, c_size;
+
+    if (desc->nb_layers != 1 || layer->nb_planes != nb_planes)
+        return AVERROR(EINVAL);
+    for (int i = 0; i < nb_planes; i++)
+        if (layer->planes[i].object_index)
+            return AVERROR(EINVAL);
+    if (nb_planes == 1)
+        return 0;
+
+    c_pitch = nb_planes == 2 ? ((ptrdiff_t)hs * 2) >> pix_desc->log2_chroma_w
+                             : hs >> pix_desc->log2_chroma_w;
+    c_size  = c_pitch * (vs >> pix_desc->log2_chroma_h);
+
+    if (layer->planes[1].offset != (ptrdiff_t)hs * vs ||
+        layer->planes[1].pitch  != c_pitch)
+        return AVERROR(EINVAL);
+    if (nb_planes == 3 &&
+        (layer->planes[2].offset != layer->planes[1].offset + c_size ||
+         layer->planes[2].pitch  != c_pitch))
+        return AVERROR(EINVAL);
+    if (desc->objects[0].size < (size_t)(layer->planes[nb_planes - 1].offset + c_size))
+        return AVERROR(EINVAL);
+
+    return 0;
 }
 
 static int get_afbc_byte_stride(const AVPixFmtDescriptor *desc,
@@ -448,7 +485,10 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
         return AVERROR_EXTERNAL;
     }
 
-    r->cfg_init = 1;
+    r->cfg_init   = 1;
+    r->cfg_afbc   = is_afbc;
+    r->hor_stride = hor_stride;
+    r->ver_stride = ver_stride;
     av_log(avctx, AV_LOG_VERBOSE, "Configured with size: %dx%d | pix_fmt: %s | sw_pix_fmt: %s\n",
            avctx->width, avctx->height,
            av_get_pix_fmt_name(avctx->pix_fmt), av_get_pix_fmt_name(r->pix_fmt));
@@ -958,9 +998,26 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
             ret = AVERROR(EINVAL);
             goto exit;
         }
+        if ((ret = check_drm_layout(drm_desc, r->pix_fmt, hor_stride, ver_stride)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "Unsupported DRM frame layout, the planes must "
+                   "follow each other in one object at the luma pitch\n");
+            goto exit;
+        }
 
         mpp_frame_set_hor_stride(mpp_frame, hor_stride);
         mpp_frame_set_ver_stride(mpp_frame, ver_stride);
+    }
+
+    /* the prep config, which MPP reads the strides from, is set on the first frame */
+    if (r->cfg_init && (is_afbc != r->cfg_afbc ||
+                        (!is_afbc && (hor_stride != r->hor_stride ||
+                                      ver_stride != r->ver_stride)))) {
+        av_log(avctx, AV_LOG_ERROR, "Input frame layout changed mid-stream "
+               "(%s %dx%d to %s %dx%d), which is not supported\n",
+               r->cfg_afbc ? "AFBC" : "stride", r->hor_stride, r->ver_stride,
+               is_afbc ? "AFBC" : "stride", hor_stride, ver_stride);
+        ret = AVERROR(EINVAL);
+        goto exit;
     }
 
     buf_info.type  = MPP_BUFFER_TYPE_DRM;
