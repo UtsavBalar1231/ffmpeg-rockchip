@@ -262,6 +262,7 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
     case AV_PIX_FMT_GRAY8:
         pix_fmts[1] = AV_PIX_FMT_GRAY8;
         is_fmt_supported =
+            avctx->codec_id == AV_CODEC_ID_HEVC ||
             avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
     case AV_PIX_FMT_NONE: /* fallback to drm_prime */
