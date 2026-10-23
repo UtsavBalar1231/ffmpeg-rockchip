@@ -232,6 +232,83 @@ static void check_packed10_to_planar(void)
     }
 }
 
+static void check_packed10_to_p01x(void)
+{
+    static const struct {
+        enum AVPixelFormat src, dst;
+    } pairs[] = {
+        { AV_PIX_FMT_NV15,        AV_PIX_FMT_P010LE },
+        { AV_PIX_FMT_NV20_PACKED, AV_PIX_FMT_P210LE },
+    };
+    const int srcStride[4] = { PACKED10_SRC_STRIDE, PACKED10_SRC_STRIDE };
+    const int dstStride[4] = { PACKED10_DST_STRIDE, PACKED10_DST_STRIDE };
+
+    declare_func(int, SwsInternal *c, const uint8_t *const src[],
+                      const int srcStride[], int srcSliceY, int srcSliceH,
+                      uint8_t *const dstParam[], const int dstStride[]);
+
+    LOCAL_ALIGNED_16(uint8_t, src_y,  [PACKED10_SRC_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, src_uv, [PACKED10_SRC_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst0_y,  [PACKED10_DST_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst0_uv, [PACKED10_DST_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst1_y,  [PACKED10_DST_SIZE]);
+    LOCAL_ALIGNED_16(uint8_t, dst1_uv, [PACKED10_DST_SIZE]);
+    uint8_t *const dst0[4] = { dst0_y, dst0_uv };
+    uint8_t *const dst1[4] = { dst1_y, dst1_uv };
+
+    randomize_buffers(src_y,  PACKED10_SRC_SIZE);
+    randomize_buffers(src_uv, PACKED10_SRC_SIZE);
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(pairs); i++) {
+        const AVPixFmtDescriptor *src_desc = av_pix_fmt_desc_get(pairs[i].src);
+        const AVPixFmtDescriptor *dst_desc = av_pix_fmt_desc_get(pairs[i].dst);
+        int vsub = src_desc->log2_chroma_h;
+
+        for (int j = 0; j < FF_ARRAY_ELEMS(packed10_widths); j++) {
+            int width = packed10_widths[j];
+            SwsContext *sws;
+            SwsInternal *c;
+
+            sws = sws_getContext(width, PACKED10_LINES, pairs[i].src,
+                                 width, PACKED10_LINES, pairs[i].dst,
+                                 0, NULL, NULL, NULL);
+            if (!sws) {
+                fail();
+                continue;
+            }
+            c = sws_internal(sws);
+
+            if (check_func(c->convert_unscaled, "%s_%s_%d",
+                           src_desc->name, dst_desc->name, width)) {
+                const uint8_t *src[4] = { src_y, src_uv };
+                /* Second slice, starting at an even line. */
+                const uint8_t *src_s[4] = { src_y  + 2 * srcStride[0],
+                                            src_uv + (2 >> vsub) * srcStride[1] };
+
+                memset(dst0_y,  0xFF, PACKED10_DST_SIZE);
+                memset(dst0_uv, 0xFF, PACKED10_DST_SIZE);
+                memset(dst1_y,  0xFF, PACKED10_DST_SIZE);
+                memset(dst1_uv, 0xFF, PACKED10_DST_SIZE);
+
+                call_ref(c, src, srcStride, 0, PACKED10_LINES, dst0, dstStride);
+                call_new(c, src, srcStride, 0, PACKED10_LINES, dst1, dstStride);
+                if (memcmp(dst0_y,  dst1_y,  PACKED10_DST_SIZE) ||
+                    memcmp(dst0_uv, dst1_uv, PACKED10_DST_SIZE))
+                    fail();
+
+                call_ref(c, src_s, srcStride, 2, PACKED10_LINES - 2, dst0, dstStride);
+                call_new(c, src_s, srcStride, 2, PACKED10_LINES - 2, dst1, dstStride);
+                if (memcmp(dst0_y,  dst1_y,  PACKED10_DST_SIZE) ||
+                    memcmp(dst0_uv, dst1_uv, PACKED10_DST_SIZE))
+                    fail();
+
+                bench_new(c, src, srcStride, 0, PACKED10_LINES, dst1, dstStride);
+            }
+            sws_freeContext(sws);
+        }
+    }
+}
+
 static void check_packed10_input(void)
 {
     static const enum AVPixelFormat formats[] = {
@@ -318,6 +395,9 @@ void checkasm_check_sw_yuv2yuv(void)
 
     check_packed10_to_planar();
     report("packed10_to_planar");
+
+    check_packed10_to_p01x();
+    report("packed10_to_p01x");
 
     check_packed10_input();
     report("packed10_input");
