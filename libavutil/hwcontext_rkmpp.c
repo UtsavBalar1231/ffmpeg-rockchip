@@ -95,17 +95,31 @@ static const struct {
     { AV_PIX_FMT_X2BGR10BE, DRM_FORMAT_XBGR2101010 | DRM_FORMAT_BIG_ENDIAN, },
 };
 
+/* MPP's DRM allocator honours DMA32 itself; with dma-heap it needs a DMA32
+ * heap, else it falls back to the uncached heap even for cacheable requests */
+static int rkmpp_dma32_heap_usable(void)
+{
+    if (access("/dev/dma_heap", F_OK))
+        return 1;
+    return !access("/dev/dma_heap/system-dma32", F_OK) ||
+           !access("/dev/dma_heap/system-uncached-dma32", F_OK);
+}
+
 static int rkmpp_device_create(AVHWDeviceContext *hwdev, const char *device,
                                AVDictionary *opts, int flags)
 {
     AVRKMPPDeviceContext *hwctx = hwdev->hwctx;
     AVDictionaryEntry *opt_d = NULL;
 
-    hwctx->flags = MPP_BUFFER_FLAGS_DMA32;
+    hwctx->flags = rkmpp_dma32_heap_usable() ? MPP_BUFFER_FLAGS_DMA32 : 0;
 
     opt_d = av_dict_get(opts, "dma32", NULL, 0);
-    if (opt_d && !strtol(opt_d->value, NULL, 10))
-        hwctx->flags &= ~MPP_BUFFER_FLAGS_DMA32;
+    if (opt_d) {
+        if (strtol(opt_d->value, NULL, 10))
+            hwctx->flags |= MPP_BUFFER_FLAGS_DMA32;
+        else
+            hwctx->flags &= ~MPP_BUFFER_FLAGS_DMA32;
+    }
 
     opt_d = av_dict_get(opts, "cacheable", NULL, 0);
     if (opt_d && strtol(opt_d->value, NULL, 10))
