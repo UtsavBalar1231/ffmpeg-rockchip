@@ -226,12 +226,23 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
         pix_fmts[1] = AV_PIX_FMT_NV16;
         is_fmt_supported =
             avctx->codec_id == AV_CODEC_ID_H264 ||
+            avctx->codec_id == AV_CODEC_ID_HEVC ||
             avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
     case AV_PIX_FMT_YUV422P10:
         pix_fmts[1] = AV_PIX_FMT_NV20_PACKED;
         is_fmt_supported =
-            avctx->codec_id == AV_CODEC_ID_H264;
+            avctx->codec_id == AV_CODEC_ID_H264 ||
+            avctx->codec_id == AV_CODEC_ID_HEVC;
+        break;
+    case AV_PIX_FMT_YUV411P:
+    case AV_PIX_FMT_YUVJ411P:
+    case AV_PIX_FMT_YUV440P:
+    case AV_PIX_FMT_YUVJ440P:
+        /* converted by the JPEG decoder, see rkmpp_mjpeg_set_output_format() */
+        pix_fmts[1] = AV_PIX_FMT_NV12;
+        is_fmt_supported =
+            avctx->codec_id == AV_CODEC_ID_MJPEG;
         break;
     case AV_PIX_FMT_YUV444P:
     case AV_PIX_FMT_YUVJ444P:
@@ -906,7 +917,7 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             }
             av_log(avctx, AV_LOG_ERROR, "MPP cannot decode this JPEG. The YCbCr format may not be "
                    "supported. Supported: YUV420(2*2:1*1:1*1) | YUV422(2*1:1*1:1*1) | "
-                   "YUV444(1*1:1*1:1*1)\n");
+                   "YUV444(1*1:1*1:1*1) | YUV440(1*2:1*1:1*1) | YUV411(4*1:1*1:1*1) | YUV400\n");
             ret = AVERROR_INVALIDDATA;
             goto exit;
         }
@@ -1108,7 +1119,8 @@ static int rkmpp_send_eos(AVCodecContext *avctx)
     return 0;
 }
 
-static int rkmpp_mjpeg_parse_size(const uint8_t *data, int size, int *width, int *height)
+static int rkmpp_mjpeg_parse_sof(const uint8_t *data, int size, int *width, int *height,
+                                 int *to_nv12)
 {
     GetByteContext gb;
 
@@ -1130,9 +1142,20 @@ static int rkmpp_mjpeg_parse_size(const uint8_t *data, int size, int *width, int
 
         len = bytestream2_get_be16(&gb);
         if (marker <= 0xcf && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
+            int nb_components, hv[3] = { 0 };
+
             bytestream2_skip(&gb, 1); /* sample precision */
             *height = bytestream2_get_be16(&gb);
             *width  = bytestream2_get_be16(&gb);
+            nb_components = bytestream2_get_byte(&gb);
+            for (int i = 0; i < FFMIN(nb_components, 3); i++) {
+                bytestream2_skip(&gb, 1); /* component id */
+                hv[i] = bytestream2_get_byte(&gb);
+                bytestream2_skip(&gb, 1); /* quantization table */
+            }
+            /* 4:1:1 and 4:4:0 */
+            *to_nv12 = nb_components == 3 && (hv[0] == 0x41 || hv[0] == 0x12) &&
+                       hv[1] == 0x11 && hv[2] == 0x11;
             return *width > 0 && *height > 0 ? 0 : AVERROR_INVALIDDATA;
         }
         if (len < 2)
@@ -1144,12 +1167,13 @@ static int rkmpp_mjpeg_parse_size(const uint8_t *data, int size, int *width, int
 
 /* MPP checks the output buffer size only after programming the hardware,
  * so size it from the frame header rather than the container */
-static int rkmpp_mjpeg_get_buf_size(AVCodecContext *avctx, const AVPacket *pkt, size_t *buf_sz)
+static int rkmpp_mjpeg_get_buf_size(AVCodecContext *avctx, const AVPacket *pkt, size_t *buf_sz,
+                                    int *to_nv12)
 {
     RKMPPDecContext *r = avctx->priv_data;
     int width, height;
 
-    if (rkmpp_mjpeg_parse_size(pkt->data, pkt->size, &width, &height) < 0 ||
+    if (rkmpp_mjpeg_parse_sof(pkt->data, pkt->size, &width, &height, to_nv12) < 0 ||
         av_image_check_size(width, height, 0, avctx) < 0) {
         av_log(avctx, AV_LOG_ERROR, "No valid frame size in the JPEG header\n");
         return AVERROR_INVALIDDATA;
@@ -1169,6 +1193,34 @@ static int rkmpp_mjpeg_get_buf_size(AVCodecContext *avctx, const AVPacket *pkt, 
     }
 
     *buf_sz = (size_t)FFALIGN(width, 16) * FFALIGN(height, 16) << 2;
+    return 0;
+}
+
+/* FFmpeg has no semi-planar 4:1:1 or 4:4:0 format, but the post-processor
+ * of the MPP JPEG decoder can write NV12 instead. MPP applies the requested
+ * format to every later frame, so it is chosen from the first JPEG. */
+static int rkmpp_mjpeg_set_output_format(AVCodecContext *avctx, int to_nv12)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+    MppFrameFormat out_fmt = MPP_FMT_YUV420SP;
+    int ret;
+
+    if (r->mjpeg_fmt_set) {
+        if (to_nv12 == r->mjpeg_to_nv12)
+            return 0;
+        av_log(avctx, AV_LOG_ERROR, "JPEG chroma subsampling changed, "
+               "reopen the decoder to change it\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (to_nv12 &&
+        (ret = r->mapi->control(r->mctx, MPP_DEC_SET_OUTPUT_FORMAT, &out_fmt)) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set NV12 output for 4:1:1/4:4:0 JPEG: %d\n", ret);
+        return AVERROR_EXTERNAL;
+    }
+
+    r->mjpeg_to_nv12 = to_nv12;
+    r->mjpeg_fmt_set = 1;
     return 0;
 }
 
@@ -1273,10 +1325,12 @@ static int rkmpp_send_packet(AVCodecContext *avctx, AVPacket *pkt)
     if (avctx->codec_id == AV_CODEC_ID_MJPEG) {
         MppBuffer mpp_buf = NULL;
         size_t frame_buf_sz;
+        int to_nv12;
 
         av_assert0(r->buf_group_misc);
 
-        if ((ret = rkmpp_mjpeg_get_buf_size(avctx, pkt, &frame_buf_sz)) < 0)
+        if ((ret = rkmpp_mjpeg_get_buf_size(avctx, pkt, &frame_buf_sz, &to_nv12)) < 0 ||
+            (ret = rkmpp_mjpeg_set_output_format(avctx, to_nv12)) < 0)
             return ret;
 
         /* the input slot of the MJPEG decoder must be a DRM/DMA buffer,
