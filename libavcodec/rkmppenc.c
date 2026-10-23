@@ -1063,6 +1063,13 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
         goto exit;
     }
 
+    /* a frame that failed, and each P frame MPP drops until the next IDR */
+    if (!mpp_packet_get_length(mpp_pkt)) {
+        av_log(avctx, AV_LOG_WARNING, "MPP failed to encode a frame, dropping its empty packet\n");
+        ret = AVERROR(EAGAIN);
+        goto exit;
+    }
+
     /* freeing MppPacket data in buffer callbacks is not supported in async mode */
     {
         size_t mpp_pkt_length = mpp_packet_get_length(mpp_pkt);
