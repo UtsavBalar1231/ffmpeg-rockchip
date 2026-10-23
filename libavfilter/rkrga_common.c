@@ -669,36 +669,29 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     info.sync_mode    = RGA_BLIT_ASYNC;
 
     if (!pat_preproc) {
-#ifdef RGA_NORMAL_DST_FULL_CSC_FIXUP
-        if (in1_info && picref_pat) {
-            enum AVColorSpace pat_colorspace = picref_pat->colorspace;
-            enum AVColorRange pat_color_range = picref_pat->color_range;
-            /* yuv2rgb src->pat */
-            set_colorspace_info(in0_info, in->colorspace, in->color_range,
-                                in1_info, &pat_colorspace, &pat_color_range,
-                                &info.color_space_mode);
-            /* rgb2yuv pat->dst */
-            set_colorspace_info(in1_info, pat_colorspace, pat_color_range,
-                                out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                &info.color_space_mode);
-        } else
-#endif
-        {
-            set_colorspace_info(in0_info, in->colorspace, in->color_range,
-                                out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
-                                &info.color_space_mode);
+        int yuv_in  = !(in0_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB);
+        int rgb_out = out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB;
+        int full    = is_full_range_yuv(in0_info, in->color_range);
+
+        set_colorspace_info(in0_info, in->colorspace, in->color_range,
+                            out_info, &out_frame->frame->colorspace, &out_frame->frame->color_range,
+                            &info.color_space_mode);
+
+        /* The overlay is blended in RGB, so the main input goes to RGB and back. Use its own
+         * matrix both ways, so that it is kept and the overlay is encoded as the output is tagged. */
+        if (picref_pat && yuv_in && !rgb_out) {
+            int y2r = get_yuv2rgb_mode(in->colorspace, full);
+            int r2y = y2r == IM_YUV_TO_RGB_BT709_LIMIT ? IM_RGB_TO_YUV_BT709_LIMIT :
+                      full ? IM_RGB_TO_YUV_BT601_FULL : IM_RGB_TO_YUV_BT601_LIMIT;
+
+            info.color_space_mode = y2r | r2y;
         }
 
-        if (!r->csc_warned &&
-            !(in0_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) &&
-            (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
-            int full = is_full_range_yuv(in0_info, in->color_range);
-
-            if (!has_yuv2rgb_matrix(in->colorspace, full)) {
-                av_log(ctx, AV_LOG_WARNING, "%s %s range input is converted to RGB with BT.601 coefficients\n",
-                       av_color_space_name(in->colorspace), full ? "full" : "limited");
-                r->csc_warned = 1;
-            }
+        if (!r->csc_warned && yuv_in && (rgb_out || picref_pat) &&
+            !has_yuv2rgb_matrix(in->colorspace, full)) {
+            av_log(ctx, AV_LOG_WARNING, "%s %s range input is converted to RGB with BT.601 coefficients\n",
+                   av_color_space_name(in->colorspace), full ? "full" : "limited");
+            r->csc_warned = 1;
         }
     }
 
@@ -1524,7 +1517,7 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     }
 
     /* DST */
-    if (!(dst_frame = query_frame(r, outlink, src_frame->frame, picref_pat, 0))) {
+    if (!(dst_frame = query_frame(r, outlink, src_frame->frame, do_overlay ? picref_pat : NULL, 0))) {
         av_log(ctx, AV_LOG_ERROR, "Failed to query an output frame\n");
         return AVERROR(ENOMEM);
     }
