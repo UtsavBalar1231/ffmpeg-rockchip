@@ -1224,7 +1224,8 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     }
     if (avctx->nb_inputs > 1) {
         RGAFrameInfo *in1_info = &r->in_rga_frame_infos[1];
-        int need_premultiply = 0;
+        /* Opaque pixels are unchanged by premultiplying, and the global alpha then scales their colour */
+        int need_premultiply = 1;
 
         if (r->in_rga_frame_infos[1].pix_desc->flags & AV_PIX_FMT_FLAG_ALPHA)
             need_premultiply = param->in_alpha_format == 0;
@@ -1435,8 +1436,8 @@ static int call_rkrga_blit(AVFilterContext *avctx,
         const RKRGAContext *r = avctx->priv;
 
         usage  |= src_info->blend;
-        /* im2d passes src.global_alpha as the fg alpha, as c_RkRgaBlit did with blend bits 16-23 */
-        src_buf.global_alpha = r->in_rga_frame_infos[1].global_alpha;
+        /* im2d sends dst.global_alpha as the bg alpha, which the kernel applies to src1 */
+        dst_buf.global_alpha = r->in_rga_frame_infos[1].global_alpha;
         pat_buf = info_to_im_buffer(pat_info);
         prect   = info_to_im_rect(pat_info);
     }
