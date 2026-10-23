@@ -187,8 +187,12 @@ static int rkmpp_get_aligned_linesize(enum AVPixelFormat pix_fmt, int width, int
         linesize = FFALIGN(linesize / pixel_width, 16) * pixel_width;
     } else if (is_yuv && is_fully_planar) {
         linesize = FFALIGN(linesize, 16 >> (plane ? pixdesc->log2_chroma_w : 0));
-    } else
-        linesize = FFALIGN(linesize, 64);
+    } else {
+        /* MPP derives the interleaved chroma pitch from the luma pitch */
+        linesize = FFALIGN(av_image_get_linesize(pix_fmt, width, 0), 64);
+        if (plane)
+            linesize = linesize * 2 >> pixdesc->log2_chroma_w;
+    }
 
     return linesize;
 }
