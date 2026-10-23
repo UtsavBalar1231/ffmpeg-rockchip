@@ -1408,7 +1408,7 @@ static int call_rkrga_blit(AVFilterContext *avctx,
 {
     rga_buffer_t src_buf, dst_buf, pat_buf = { 0 };
     im_rect srect, drect, prect = { 0 };
-    im_opt_t opt = { 0 };
+    im_opt_t opt = { .version = RGA_CURRENT_API_HEADER_VERSION };
     IM_STATUS status;
     int usage = 0;
     int release_fence_fd = -1;
