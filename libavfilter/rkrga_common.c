@@ -278,6 +278,20 @@ static int get_yuv2rgb_mode(enum AVColorSpace spc, int full)
     return spc == AVCOL_SPC_BT709 ? IM_YUV_TO_RGB_BT709_LIMIT : IM_YUV_TO_RGB_BT601_LIMIT;
 }
 
+static int has_yuv2rgb_matrix(enum AVColorSpace spc, int full)
+{
+    switch (spc) {
+    case AVCOL_SPC_UNSPECIFIED:
+    case AVCOL_SPC_BT470BG:
+    case AVCOL_SPC_SMPTE170M:
+        return 1;
+    case AVCOL_SPC_BT709:
+        return !full;
+    default:
+        return 0;
+    }
+}
+
 static void set_colorspace_info(RGAFrameInfo *in_info,
                                 enum AVColorSpace in_spc,
                                 enum AVColorRange in_rng,
@@ -675,12 +689,16 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
                                 &info.color_space_mode);
         }
 
-        if (!r->bt2020_warned &&
-            (in->colorspace == AVCOL_SPC_BT2020_NCL || in->colorspace == AVCOL_SPC_BT2020_CL) &&
+        if (!r->csc_warned &&
             !(in0_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB) &&
             (out_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
-            av_log(ctx, AV_LOG_WARNING, "BT.2020 input is converted to RGB with BT.601 coefficients\n");
-            r->bt2020_warned = 1;
+            int full = is_full_range_yuv(in0_info, in->color_range);
+
+            if (!has_yuv2rgb_matrix(in->colorspace, full)) {
+                av_log(ctx, AV_LOG_WARNING, "%s %s range input is converted to RGB with BT.601 coefficients\n",
+                       av_color_space_name(in->colorspace), full ? "full" : "limited");
+                r->csc_warned = 1;
+            }
         }
     }
 
