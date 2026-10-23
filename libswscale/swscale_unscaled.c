@@ -2758,6 +2758,7 @@ void ff_get_unscaled_swscale(SwsInternal *c)
     if ( srcFormat == dstFormat ||
         (srcFormat == AV_PIX_FMT_YUVA420P && dstFormat == AV_PIX_FMT_YUV420P) ||
         (srcFormat == AV_PIX_FMT_YUV420P && dstFormat == AV_PIX_FMT_YUVA420P) ||
+        !(av_pix_fmt_desc_get(srcFormat)->flags & AV_PIX_FMT_FLAG_BITSTREAM) &&
         (isFloat(srcFormat) == isFloat(dstFormat) && isFloat16(srcFormat) == isFloat16(dstFormat)) && ((isPlanarYUV(srcFormat) && isPlanarGray(dstFormat)) ||
         (isPlanarYUV(dstFormat) && isPlanarGray(srcFormat)) ||
         (isPlanarGray(dstFormat) && isPlanarGray(srcFormat)) ||
