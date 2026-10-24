@@ -223,6 +223,7 @@ extern const FFFilter ff_vf_colordetect;
 extern const FFFilter ff_vf_colorize;
 extern const FFFilter ff_vf_colorkey;
 extern const FFFilter ff_vf_colorkey_opencl;
+extern const FFFilter ff_vf_colorkey_rkrga;
 extern const FFFilter ff_vf_colorhold;
 extern const FFFilter ff_vf_colorlevels;
 extern const FFFilter ff_vf_colormap;

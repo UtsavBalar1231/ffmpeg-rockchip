@@ -29097,6 +29097,52 @@ By default the driver picks a core.
 Number of frames in flight. Default is 2.
 @end table
 
+@section colorkey_rkrga
+
+Make the pixels of a color transparent with the RGA color key, like
+@code{colorkey}. The input must be RGBA, BGRA, ARGB or ABGR. The output is
+a new frame of the same format, for example to chain into
+@code{overlay_rkrga}.
+
+It accepts the following options:
+
+@table @option
+@item color
+The color which will be replaced with transparency. Default is black.
+
+@item similarity
+Similarity percentage with the key color. Default is 0.01.
+@code{colorkey} keys the pixels within a distance of the key color; the
+RGA keys a range of each of R, G and B, so @var{similarity} sets the range
+that keys the same pixels as @code{colorkey} along each channel, and keys
+more pixels that differ in several channels.
+@end table
+
+The options can be changed at runtime with a command. It differs from
+@code{colorkey} in these ways:
+
+@itemize
+@item
+There is no @option{blend} option; keyed pixels are fully transparent.
+
+@item
+Keyed pixels are written as transparent black, where @code{colorkey}
+keeps their color.
+
+@item
+@code{colorkey} makes the other pixels opaque; here the input is expected
+to be opaque.
+@end itemize
+
+@subsection Examples
+@itemize
+@item
+Key out a green background and draw the result over another video:
+@example
+-filter_complex "[1:v]colorkey_rkrga=color=0x00ff00:similarity=0.1[fg];[0:v][fg]overlay_rkrga"
+@end example
+@end itemize
+
 @section drawbox_rkrga
 
 Draw a colored box on the input video, like @code{drawbox}, with RGA color
