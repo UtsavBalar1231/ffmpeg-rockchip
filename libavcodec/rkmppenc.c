@@ -805,10 +805,36 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
             qp_max = r->qp_max >= 1 ? r->qp_max : 99;
             qp_min = r->qp_min >= 1 ? r->qp_min : 1;
             qp_max_i = qp_min_i = 0;
-            /* jpeg use special codec config to control qtable */
-            mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", qp_init);
-            mpp_enc_cfg_set_s32(cfg, "jpeg:qf_max", qp_max);
-            mpp_enc_cfg_set_s32(cfg, "jpeg:qf_min", qp_min);
+
+            if (avctx->chroma_intra_matrix && !avctx->intra_matrix) {
+                av_log(avctx, AV_LOG_ERROR, "chroma_intra_matrix needs intra_matrix\n");
+                return AVERROR(EINVAL);
+            }
+            if (avctx->intra_matrix) {
+                /* both in raster order, as MPP's tables */
+                const uint16_t *luma   = avctx->intra_matrix;
+                const uint16_t *chroma = avctx->chroma_intra_matrix ?
+                                         avctx->chroma_intra_matrix : luma;
+                uint8_t qtable_y[64], qtable_c[64];
+
+                for (int i = 0; i < 64; i++) {
+                    qtable_y[i] = av_clip(luma[i],   1, 255);
+                    qtable_c[i] = av_clip(chroma[i], 1, 255);
+                }
+                /* MPP takes the tables only when no quality factor is set */
+                if (mpp_enc_cfg_set_st(cfg, "jpeg:qtable_y", qtable_y) != MPP_OK ||
+                    mpp_enc_cfg_set_st(cfg, "jpeg:qtable_u", qtable_c) != MPP_OK ||
+                    mpp_enc_cfg_set_st(cfg, "jpeg:qtable_v", qtable_c) != MPP_OK) {
+                    av_log(avctx, AV_LOG_ERROR, "Failed to set the quantization tables\n");
+                    return AVERROR_EXTERNAL;
+                }
+                av_log(avctx, AV_LOG_VERBOSE, "Using the given quantization tables\n");
+            } else {
+                /* jpeg use special codec config to control qtable */
+                mpp_enc_cfg_set_s32(cfg, "jpeg:q_factor", qp_init);
+                mpp_enc_cfg_set_s32(cfg, "jpeg:qf_max", qp_max);
+                mpp_enc_cfg_set_s32(cfg, "jpeg:qf_min", qp_min);
+            }
         }
         break;
     default:
