@@ -85,6 +85,7 @@ typedef struct RKRGAContext {
 
     RGAFrameInfo       *in_rga_frame_infos;
     RGAFrameInfo        out_rga_frame_info;
+    RGAFrameInfo        pat_preproc_info;
 
     int scheduler_core;
     int async_depth;

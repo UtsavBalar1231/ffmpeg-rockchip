@@ -87,35 +87,18 @@ static const RGAFormatMap supported_formats_main[] = {
     YUV_FORMATS
     RGB_FORMATS
 };
-
-static const RGAFormatMap supported_formats_overlay[] = {
-    RGB_FORMATS
-};
 #undef YUV_FORMATS
 #undef RGB_FORMATS
 
 static int map_av_to_rga_format(enum AVPixelFormat in_format,
-                                enum _Rga_SURF_FORMAT *out_format, int is_overlay)
+                                enum _Rga_SURF_FORMAT *out_format)
 {
     int i;
-
-    if (is_overlay)
-        goto overlay;
 
     for (i = 0; i < FF_ARRAY_ELEMS(supported_formats_main); i++) {
         if (supported_formats_main[i].pix_fmt == in_format) {
             if (out_format)
                 *out_format = supported_formats_main[i].rga_fmt;
-            return 1;
-        }
-    }
-    return 0;
-
-overlay:
-    for (i = 0; i < FF_ARRAY_ELEMS(supported_formats_overlay); i++) {
-        if (supported_formats_overlay[i].pix_fmt == in_format) {
-            if (out_format)
-                *out_format = supported_formats_overlay[i].rga_fmt;
             return 1;
         }
     }
@@ -586,7 +569,7 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     rga_info_t info = { .mmuFlag = 1, };
     RGAFrameInfo *in0_info = &r->in_rga_frame_infos[0];
     RGAFrameInfo *in1_info = ctx->nb_inputs > 1 ? &r->in_rga_frame_infos[1] : NULL;
-    RGAFrameInfo *out_info = pat_preproc ? in1_info : &r->out_rga_frame_info;
+    RGAFrameInfo *out_info = pat_preproc ? &r->pat_preproc_info : &r->out_rga_frame_info;
     AVBufferRef *hw_frame_ctx = pat_preproc ? r->pat_preproc_hwframes_ctx : outl->hw_frames_ctx;
     int w_stride = 0, h_stride = 0;
     AVDRMFrameDescriptor *desc;
@@ -703,6 +686,10 @@ static RGAFrame *query_frame(RKRGAContext *r, AVFilterLink *outlink,
     }
 
     if (pat_preproc) {
+        if (!(in1_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB))
+            info.color_space_mode = get_yuv2rgb_mode(in->colorspace,
+                                                     is_full_range_yuv(in1_info, in->color_range));
+
         /* Write alpha so that the area around an opaque overlay stays transparent */
         if (info.format == RK_FORMAT_RGBX_8888)
             info.format = RK_FORMAT_RGBA_8888;
@@ -849,7 +836,7 @@ static av_cold int init_pat_preproc_hwframes_ctx(AVFilterContext *avctx)
     AVFilterLink      *inlink1 = avctx->inputs[1];
     FilterLink        *inl0    = ff_filter_link(inlink0);
     FilterLink        *inl1    = ff_filter_link(inlink1);
-    AVHWFramesContext *hwfc_in0, *hwfc_in1;
+    AVHWFramesContext *hwfc_in0;
     AVHWFramesContext *hwfc_pat;
     AVBufferRef       *hwfc_pat_ref;
     AVHWDeviceContext *device_ctx0;
@@ -860,7 +847,6 @@ static av_cold int init_pat_preproc_hwframes_ctx(AVFilterContext *avctx)
         return AVERROR(EINVAL);
 
     hwfc_in0 = (AVHWFramesContext *)inl0->hw_frames_ctx->data;
-    hwfc_in1 = (AVHWFramesContext *)inl1->hw_frames_ctx->data;
     device_ref0 = hwfc_in0->device_ref;
     device_ctx0 = (AVHWDeviceContext *)device_ref0->data;
 
@@ -881,7 +867,7 @@ static av_cold int init_pat_preproc_hwframes_ctx(AVFilterContext *avctx)
 
     hwfc_pat = (AVHWFramesContext *)hwfc_pat_ref->data;
     hwfc_pat->format    = AV_PIX_FMT_DRM_PRIME;
-    hwfc_pat->sw_format = hwfc_in1->sw_format;
+    hwfc_pat->sw_format = r->pat_preproc_info.pix_fmt;
     hwfc_pat->width     = inlink0->w;
     hwfc_pat->height    = inlink0->h;
 
@@ -1024,6 +1010,16 @@ static av_cold int verify_rga_frame_info(AVFilterContext *avctx,
                av_get_pix_fmt_name(dst->pix_fmt));
         return AVERROR(ENOSYS);
     }
+    /* A YUV overlay is converted to RGBA on RGA2 before the blend */
+    if (pat && !(pat->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+        if (pat->pix_fmt == AV_PIX_FMT_P010 || pat->pix_fmt == AV_PIX_FMT_P210 ||
+            (!r->has_rga2p && (pat->pix_fmt == AV_PIX_FMT_NV24 || pat->pix_fmt == AV_PIX_FMT_NV42))) {
+            av_log(avctx, AV_LOG_ERROR, "'%s' as overlay input is not supported\n",
+                   av_get_pix_fmt_name(pat->pix_fmt));
+            return AVERROR(ENOSYS);
+        }
+        r->is_rga2_used = 1;
+    }
 
     if (src->pix_fmt == AV_PIX_FMT_GRAY8 ||
         src->pix_fmt == AV_PIX_FMT_YUV420P ||
@@ -1125,7 +1121,7 @@ static av_cold int fill_rga_frame_info_by_link(AVFilterContext *avctx,
 
     hwfc = (AVHWFramesContext *)l->hw_frames_ctx->data;
 
-    if (!map_av_to_rga_format(hwfc->sw_format, &info->rga_fmt, (is_inlink && nb_link > 0))) {
+    if (!map_av_to_rga_format(hwfc->sw_format, &info->rga_fmt)) {
         av_log(avctx, AV_LOG_ERROR, "Unsupported '%s' pad %d format: '%s'\n",
                (is_inlink ? "input" : "output"), nb_link,
                av_get_pix_fmt_name(hwfc->sw_format));
@@ -1264,6 +1260,15 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
         }
         in1_info->overlay_x = FFMAX(param->overlay_x, 0);
         in1_info->overlay_y = FFMAX(param->overlay_y, 0);
+
+        /* The overlay channel reads only RGB, so a YUV overlay is converted to RGBA first */
+        r->pat_preproc_info = *in1_info;
+        if (!(in1_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
+            r->pat_preproc_info.pix_fmt  = AV_PIX_FMT_RGBA;
+            r->pat_preproc_info.pix_desc = av_pix_fmt_desc_get(AV_PIX_FMT_RGBA);
+            r->pat_preproc_info.rga_fmt  = RK_FORMAT_RGBA_8888;
+            r->pat_preproc_info.bytes_pp = 4;
+        }
 
         r->is_overlay_offset_valid = (param->overlay_x < r->in_rga_frame_infos[0].act_w - 2) &&
             (param->overlay_y < r->in_rga_frame_infos[0].act_h - 2) &&
@@ -1587,7 +1592,8 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
         if (in1_info->act_w != in0_info->act_w ||
             in1_info->act_h != in0_info->act_h ||
             in1_info->overlay_x > 0 ||
-            in1_info->overlay_y > 0) {
+            in1_info->overlay_y > 0 ||
+            !(in1_info->pix_desc->flags & AV_PIX_FMT_FLAG_RGB)) {
             if (!(pat_in = submit_frame(r, inlink_pat, picref_pat, 0, 1))) {
                 av_log(ctx, AV_LOG_ERROR, "Failed to submit frame on input: %d\n",
                        FF_INLINK_IDX(inlink_pat));
