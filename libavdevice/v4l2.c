@@ -35,6 +35,8 @@
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/file_open.h"
+#include "libavutil/hwcontext.h"
+#include "libavutil/hwcontext_drm.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
@@ -73,6 +75,10 @@
 
 #if CONFIG_LIBV4L2
 #include <libv4l2.h>
+#endif
+
+#if CONFIG_LIBDRM
+#include <drm_fourcc.h>
 #endif
 
 #define V4L_ALLFORMATS  3
@@ -133,6 +139,15 @@ struct video_data {
     char *framerate;    /**< Set by a private option. */
     int requested_buffers; /**< Set by a private option. */
     AVRational dv_rate;
+
+    int dmabuf;         /**< Set by a private option. */
+    char *drm_device;   /**< Set by a private option. */
+    unsigned bytesperline;
+    unsigned layout_size;
+    AVDRMLayerDescriptor layer;
+    AVBufferRef *pool_ref;
+    AVBufferRef *hwdevice_ref;
+    AVBufferRef *frames_ref;
 
     int use_libv4l2;
     int (*open_f)(const char *file, int oflag, ...);
@@ -254,6 +269,9 @@ static int device_init(AVFormatContext *ctx, int *width, int *height,
        is not supported (even if type field is valid and supported) */
     if (v4l2_ioctl(s->fd, VIDIOC_S_FMT, &fmt) < 0)
         res = AVERROR(errno);
+
+    s->bytesperline = s->multiplanar ? fmt.fmt.pix_mp.plane_fmt[0].bytesperline
+                                     : fmt.fmt.pix.bytesperline;
 
     if ((*width != fmt.fmt.pix.width) || (*height != fmt.fmt.pix.height)) {
         av_log(ctx, AV_LOG_INFO,
@@ -692,16 +710,240 @@ static void largest_frame_size(AVFormatContext *ctx, uint32_t pixelformat,
 }
 #endif
 
+typedef struct DMABufPool {
+    int fd;
+    enum v4l2_buf_type buf_type;
+    int multiplanar;
+    int nb_buffers;
+    atomic_int queued;
+    atomic_int streaming;
+    AVDRMFrameDescriptor *desc;
+} DMABufPool;
+
+typedef struct DMABufRef {
+    AVBufferRef *pool;
+    int index;
+} DMABufRef;
+
+#if CONFIG_LIBDRM
+static const struct {
+    uint32_t v4l2_fmt;
+    uint32_t drm_fmt;
+} dmabuf_formats[] = {
+    { V4L2_PIX_FMT_NV12,    DRM_FORMAT_NV12     },
+#ifdef V4L2_PIX_FMT_NV16
+    { V4L2_PIX_FMT_NV16,    DRM_FORMAT_NV16     },
+#endif
+#ifdef V4L2_PIX_FMT_NV24
+    { V4L2_PIX_FMT_NV24,    DRM_FORMAT_NV24     },
+#endif
+    { V4L2_PIX_FMT_YUYV,    DRM_FORMAT_YUYV     },
+    { V4L2_PIX_FMT_UYVY,    DRM_FORMAT_UYVY     },
+    { V4L2_PIX_FMT_YUV420,  DRM_FORMAT_YUV420   },
+    { V4L2_PIX_FMT_YUV422P, DRM_FORMAT_YUV422   },
+    { V4L2_PIX_FMT_GREY,    DRM_FORMAT_R8       },
+    { V4L2_PIX_FMT_RGB565,  DRM_FORMAT_RGB565   },
+    { V4L2_PIX_FMT_RGB24,   DRM_FORMAT_BGR888   },
+    { V4L2_PIX_FMT_BGR24,   DRM_FORMAT_RGB888   },
+#ifdef V4L2_PIX_FMT_XBGR32
+    { V4L2_PIX_FMT_XBGR32,  DRM_FORMAT_XRGB8888 },
+    { V4L2_PIX_FMT_ABGR32,  DRM_FORMAT_ARGB8888 },
+#endif
+};
+#endif
+
+static void dmabuf_pool_free(void *opaque, uint8_t *data)
+{
+    DMABufPool *pool = (DMABufPool *)data;
+
+    for (int i = 0; i < pool->nb_buffers; i++)
+        if (pool->desc[i].objects[0].fd >= 0)
+            close(pool->desc[i].objects[0].fd);
+    if (pool->fd >= 0)
+        close(pool->fd);
+    av_free(pool->desc);
+    av_free(pool);
+}
+
+static int dmabuf_queue(DMABufPool *pool, int index)
+{
+    struct v4l2_plane planes[VIDEO_MAX_PLANES];
+    struct v4l2_buffer buf = {
+        .type     = pool->buf_type,
+        .index    = index,
+        .memory   = V4L2_MEMORY_MMAP,
+        .m.planes = pool->multiplanar ? planes : NULL,
+        .length   = pool->multiplanar ? VIDEO_MAX_PLANES : 0,
+    };
+
+    if (ioctl(pool->fd, VIDIOC_QBUF, &buf) < 0)
+        return AVERROR(errno);
+    atomic_fetch_add(&pool->queued, 1);
+    return 0;
+}
+
+/* Frames can outlive the demuxer: after close the buffer is not requeued. */
+static void dmabuf_release(void *opaque, uint8_t *data)
+{
+    DMABufRef *ref = opaque;
+    DMABufPool *pool = (DMABufPool *)ref->pool->data;
+    int ret;
+
+    if (atomic_load(&pool->streaming) && (ret = dmabuf_queue(pool, ref->index)) < 0)
+        av_log(NULL, AV_LOG_ERROR, "ioctl(VIDIOC_QBUF): %s\n", av_err2str(ret));
+    av_buffer_unref(&ref->pool);
+    av_free(ref);
+}
+
+static void dmabuf_free_frame(void *opaque, uint8_t *data)
+{
+    AVFrame *frame = (AVFrame *)data;
+
+    av_frame_free(&frame);
+}
+
+static int dmabuf_init(AVFormatContext *ctx, enum AVPixelFormat sw_format)
+{
+    struct video_data *s = ctx->priv_data;
+    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(sw_format);
+    AVHWFramesContext *frames;
+    unsigned pitch, offset = 0;
+    uint32_t drm_fmt = 0;
+    int nb_planes, ret;
+
+#if CONFIG_LIBDRM
+    for (int i = 0; i < FF_ARRAY_ELEMS(dmabuf_formats); i++)
+        if (dmabuf_formats[i].v4l2_fmt == s->pixelformat)
+            drm_fmt = dmabuf_formats[i].drm_fmt;
+#else
+    av_log(ctx, AV_LOG_ERROR, "DMA-BUF export requires libdrm support.\n");
+    return AVERROR(ENOSYS);
+#endif
+    if (s->use_libv4l2) {
+        av_log(ctx, AV_LOG_ERROR, "DMA-BUF export cannot be used with libv4l2.\n");
+        return AVERROR(EINVAL);
+    }
+    if (!drm_fmt || !desc) {
+        av_log(ctx, AV_LOG_ERROR, "Pixel format %s cannot be exported as "
+               "DRM PRIME frames.\n", desc ? desc->name : "none");
+        return AVERROR(EINVAL);
+    }
+
+    pitch     = s->bytesperline ? s->bytesperline
+                                : av_image_get_linesize(sw_format, s->width, 0);
+    nb_planes = av_pix_fmt_count_planes(sw_format);
+
+    s->layer.format    = drm_fmt;
+    s->layer.nb_planes = nb_planes;
+    for (int i = 0; i < nb_planes; i++) {
+        int chroma = i == 1 || i == 2;
+        unsigned p = !chroma        ? pitch :
+                     nb_planes == 2 ? (pitch * 2) >> desc->log2_chroma_w :
+                                      pitch >> desc->log2_chroma_w;
+        unsigned h = chroma ? AV_CEIL_RSHIFT(s->height, desc->log2_chroma_h) : s->height;
+
+        s->layer.planes[i].object_index = 0;
+        s->layer.planes[i].offset       = offset;
+        s->layer.planes[i].pitch        = p;
+        offset += p * h;
+    }
+    s->layout_size = offset;
+
+    ret = av_hwdevice_ctx_create(&s->hwdevice_ref, AV_HWDEVICE_TYPE_DRM,
+                                 s->drm_device, NULL, 0);
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Cannot open the DRM device %s: %s\n",
+               s->drm_device, av_err2str(ret));
+        return ret;
+    }
+
+    s->frames_ref = av_hwframe_ctx_alloc(s->hwdevice_ref);
+    if (!s->frames_ref)
+        return AVERROR(ENOMEM);
+    frames            = (AVHWFramesContext *)s->frames_ref->data;
+    frames->format    = AV_PIX_FMT_DRM_PRIME;
+    frames->sw_format = sw_format;
+    frames->width     = s->width;
+    frames->height    = s->height;
+
+    return av_hwframe_ctx_init(s->frames_ref);
+}
+
+static int dmabuf_pool_alloc(AVFormatContext *ctx, int nb_buffers)
+{
+    struct video_data *s = ctx->priv_data;
+    DMABufPool *pool = av_mallocz(sizeof(*pool));
+
+    if (!pool)
+        return AVERROR(ENOMEM);
+    pool->fd = -1;
+    s->pool_ref = av_buffer_create((uint8_t *)pool, sizeof(*pool),
+                                   dmabuf_pool_free, NULL, 0);
+    if (!s->pool_ref) {
+        av_free(pool);
+        return AVERROR(ENOMEM);
+    }
+
+    pool->desc = av_calloc(nb_buffers, sizeof(*pool->desc));
+    if (!pool->desc)
+        return AVERROR(ENOMEM);
+    for (int i = 0; i < nb_buffers; i++)
+        pool->desc[i].objects[0].fd = -1;
+    pool->nb_buffers  = nb_buffers;
+    pool->buf_type    = s->buf_type;
+    pool->multiplanar = s->multiplanar;
+
+    pool->fd = dup(s->fd);
+    if (pool->fd < 0)
+        return AVERROR(errno);
+    return 0;
+}
+
+static int dmabuf_export(AVFormatContext *ctx, int index, unsigned length)
+{
+    struct video_data *s = ctx->priv_data;
+    DMABufPool *pool = (DMABufPool *)s->pool_ref->data;
+    AVDRMFrameDescriptor *desc = &pool->desc[index];
+    struct v4l2_exportbuffer exp = {
+        .type  = s->buf_type,
+        .index = index,
+        .flags = O_RDWR,
+    };
+    int res;
+
+    if (length < s->layout_size) {
+        av_log(ctx, AV_LOG_ERROR, "Buffer %d holds %u bytes, the frame needs %u\n",
+               index, length, s->layout_size);
+        return AVERROR(EINVAL);
+    }
+    if (v4l2_ioctl(s->fd, VIDIOC_EXPBUF, &exp) < 0) {
+        res = AVERROR(errno);
+        av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_EXPBUF): %s\n", av_err2str(res));
+        return res;
+    }
+    fcntl(exp.fd, F_SETFD, FD_CLOEXEC);
+
+    desc->nb_objects     = 1;
+    desc->objects[0].fd   = exp.fd;
+    desc->objects[0].size = length;
+#if CONFIG_LIBDRM
+    desc->objects[0].format_modifier = DRM_FORMAT_MOD_LINEAR;
+#endif
+    desc->nb_layers = 1;
+    desc->layers[0] = s->layer;
+    return 0;
+}
+
 static void mmap_free(struct video_data *s, int n)
 {
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n && !s->dmabuf; i++)
         v4l2_munmap(s->buf_data[i].start, s->buf_data[i].len);
     av_freep(&s->buf_data);
 }
 
 static int mmap_init(AVFormatContext *ctx)
 {
-    int i, res;
+    int i = 0, res;
     struct video_data *s = ctx->priv_data;
     struct v4l2_requestbuffers req = {
         .type   = s->buf_type,
@@ -725,6 +967,8 @@ static int mmap_init(AVFormatContext *ctx)
         av_log(ctx, AV_LOG_ERROR, "Cannot allocate buffer data\n");
         return AVERROR(ENOMEM);
     }
+    if (s->dmabuf && (res = dmabuf_pool_alloc(ctx, req.count)) < 0)
+        goto fail;
 
     for (i = 0; i < req.count; i++) {
         unsigned int buf_length, buf_offset;
@@ -762,6 +1006,11 @@ static int mmap_init(AVFormatContext *ctx)
                    i, buf_length, s->frame_size);
             res = AVERROR(ENOMEM);
             goto fail;
+        }
+        if (s->dmabuf) {
+            if ((res = dmabuf_export(ctx, i, buf_length)) < 0)
+                goto fail;
+            continue;
         }
         s->buf_data[i].start = v4l2_mmap(NULL, buf_length,
                                          PROT_READ | PROT_WRITE, MAP_SHARED,
@@ -986,6 +1235,93 @@ static int mmap_read_frame(AVFormatContext *ctx, AVPacket *pkt)
     return pkt->size;
 }
 
+static int dmabuf_read_frame(AVFormatContext *ctx, AVPacket *pkt)
+{
+    struct video_data *s = ctx->priv_data;
+    DMABufPool *pool = (DMABufPool *)s->pool_ref->data;
+    struct v4l2_plane planes[VIDEO_MAX_PLANES];
+    struct v4l2_buffer buf;
+    AVFrame *frame;
+    DMABufRef *ref;
+    unsigned bytesused;
+    int res;
+
+    for (;;) {
+        buf = (struct v4l2_buffer) {
+            .type     = s->buf_type,
+            .memory   = V4L2_MEMORY_MMAP,
+            .m.planes = s->multiplanar ? planes : NULL,
+            .length   = s->multiplanar ? VIDEO_MAX_PLANES : 0,
+        };
+        while ((res = v4l2_ioctl(s->fd, VIDIOC_DQBUF, &buf)) < 0 && errno == EINTR);
+        if (res < 0) {
+            if (errno == EAGAIN)
+                return AVERROR(EAGAIN);
+            res = AVERROR(errno);
+            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_DQBUF): %s\n", av_err2str(res));
+            return res;
+        }
+        if (buf.index >= s->buffers) {
+            av_log(ctx, AV_LOG_ERROR, "Invalid buffer index received.\n");
+            return AVERROR(EINVAL);
+        }
+        atomic_fetch_add(&pool->queued, -1);
+        bytesused = s->multiplanar ? buf.m.planes[0].bytesused : buf.bytesused;
+
+#ifdef V4L2_BUF_FLAG_ERROR
+        if (buf.flags & V4L2_BUF_FLAG_ERROR)
+            av_log(ctx, AV_LOG_WARNING, "Dropping a corrupted frame.\n");
+        else
+#endif
+        if (bytesused < s->layout_size)
+            av_log(ctx, AV_LOG_WARNING, "Dropping a frame of %u bytes, %u were expected.\n",
+                   bytesused, s->layout_size);
+        else if (!atomic_load(&pool->queued))
+            av_log(ctx, AV_LOG_WARNING, "All capture buffers are in use, dropping a frame.\n");
+        else
+            break;
+
+        if ((res = dmabuf_queue(pool, buf.index)) < 0) {
+            av_log(ctx, AV_LOG_ERROR, "ioctl(VIDIOC_QBUF): %s\n", av_err2str(res));
+            return res;
+        }
+    }
+
+    frame = av_frame_alloc();
+    ref   = av_mallocz(sizeof(*ref));
+    if (!frame || !ref || !(ref->pool = av_buffer_ref(s->pool_ref)) ||
+        !(frame->buf[0] = av_buffer_create((uint8_t *)&pool->desc[buf.index],
+                                           sizeof(*pool->desc), dmabuf_release,
+                                           ref, AV_BUFFER_FLAG_READONLY))) {
+        if (ref)
+            av_buffer_unref(&ref->pool);
+        av_free(ref);
+        av_frame_free(&frame);
+        dmabuf_queue(pool, buf.index);
+        return AVERROR(ENOMEM);
+    }
+    ref->index     = buf.index;
+    frame->data[0] = (uint8_t *)&pool->desc[buf.index];
+    frame->format  = AV_PIX_FMT_DRM_PRIME;
+    frame->width   = s->width;
+    frame->height  = s->height;
+
+    frame->hw_frames_ctx = av_buffer_ref(s->frames_ref);
+    if (!frame->hw_frames_ctx ||
+        !(pkt->buf = av_buffer_create((uint8_t *)frame, sizeof(*frame),
+                                      dmabuf_free_frame, NULL, 0))) {
+        av_frame_free(&frame);
+        return AVERROR(ENOMEM);
+    }
+    pkt->data   = (uint8_t *)frame;
+    pkt->size   = sizeof(*frame);
+    pkt->flags |= AV_PKT_FLAG_TRUSTED;
+    pkt->pts    = buf.timestamp.tv_sec * INT64_C(1000000) + buf.timestamp.tv_usec;
+    convert_timestamp(ctx, &pkt->pts);
+
+    return pkt->size;
+}
+
 static int mmap_start(AVFormatContext *ctx)
 {
     struct video_data *s = ctx->priv_data;
@@ -1010,6 +1346,12 @@ static int mmap_start(AVFormatContext *ctx)
         }
     }
     atomic_store(&s->buffers_queued, s->buffers);
+    if (s->pool_ref) {
+        DMABufPool *pool = (DMABufPool *)s->pool_ref->data;
+
+        atomic_store(&pool->queued, s->buffers);
+        atomic_store(&pool->streaming, 1);
+    }
 
     type = s->buf_type;
     if (v4l2_ioctl(s->fd, VIDIOC_STREAMON, &type) < 0) {
@@ -1027,6 +1369,8 @@ static void mmap_close(struct video_data *s)
     enum v4l2_buf_type type;
 
     type = s->buf_type;
+    if (s->pool_ref)
+        atomic_store(&((DMABufPool *)s->pool_ref->data)->streaming, 0);
     /* We do not check for the result, because we could
      * not do anything about it anyway...
      */
@@ -1384,6 +1728,16 @@ static int v4l2_read_header(AVFormatContext *ctx)
         s->frame_size = av_image_get_buffer_size(st->codecpar->format,
                                                  s->width, s->height, 1);
 
+    if (s->dmabuf) {
+        if (codec_id != AV_CODEC_ID_RAWVIDEO || st->codecpar->format == AV_PIX_FMT_NONE) {
+            av_log(ctx, AV_LOG_ERROR, "DMA-BUF export needs a raw pixel format.\n");
+            res = AVERROR(EINVAL);
+            goto fail;
+        }
+        if ((res = dmabuf_init(ctx, st->codecpar->format)) < 0)
+            goto fail;
+    }
+
     if ((res = mmap_init(ctx)) ||
         (res = mmap_start(ctx)) < 0)
             goto fail;
@@ -1404,19 +1758,32 @@ static int v4l2_read_header(AVFormatContext *ctx)
         st->codecpar->codec_tag = MKTAG('Y', 'V', 'U', '9');
     st->codecpar->width = s->width;
     st->codecpar->height = s->height;
-    if (st->avg_frame_rate.den)
+    if (s->dmabuf) {
+        /* libavformat forces video_codec_id onto every packet's stream */
+        ctx->video_codec_id     = AV_CODEC_ID_WRAPPED_AVFRAME;
+        st->codecpar->codec_id  = AV_CODEC_ID_WRAPPED_AVFRAME;
+        st->codecpar->codec_tag = 0;
+        st->codecpar->format    = AV_PIX_FMT_DRM_PRIME;
+    } else if (st->avg_frame_rate.den)
         st->codecpar->bit_rate = s->frame_size * av_q2d(st->avg_frame_rate) * 8;
 
     return 0;
 
 fail:
+    av_buffer_unref(&s->pool_ref);
+    av_buffer_unref(&s->frames_ref);
+    av_buffer_unref(&s->hwdevice_ref);
     v4l2_close(s->fd);
     return res;
 }
 
 static int v4l2_read_packet(AVFormatContext *ctx, AVPacket *pkt)
 {
+    struct video_data *s = ctx->priv_data;
     int res;
+
+    if (s->dmabuf)
+        return dmabuf_read_frame(ctx, pkt);
 
     if ((res = mmap_read_frame(ctx, pkt)) < 0) {
         return res;
@@ -1429,11 +1796,14 @@ static int v4l2_read_close(AVFormatContext *ctx)
 {
     struct video_data *s = ctx->priv_data;
 
-    if (atomic_load(&s->buffers_queued) != s->buffers)
+    if (!s->dmabuf && atomic_load(&s->buffers_queued) != s->buffers)
         av_log(ctx, AV_LOG_WARNING, "Some buffers are still owned by the caller on "
                "close.\n");
 
     mmap_close(s);
+    av_buffer_unref(&s->pool_ref);
+    av_buffer_unref(&s->frames_ref);
+    av_buffer_unref(&s->hwdevice_ref);
 
     ff_timefilter_destroy(s->timefilter);
     v4l2_close(s->fd);
@@ -1532,6 +1902,8 @@ static const AVOption options[] = {
     { "input_format", "set preferred pixel format (for raw video) or codec name", OFFSET(pixel_format), AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "framerate",    "set frame rate",                                           OFFSET(framerate),    AV_OPT_TYPE_STRING, {.str = NULL},  0, 0,       DEC },
     { "buffers",      "set the number of capture buffers to request",            OFFSET(requested_buffers), AV_OPT_TYPE_INT, {.i64 = 256}, 1, 256,     DEC },
+    { "dmabuf",       "export the capture buffers as DRM PRIME frames",           OFFSET(dmabuf),       AV_OPT_TYPE_BOOL,   {.i64 = 0},     0, 1,       DEC },
+    { "drm_device",   "DRM device for the DRM PRIME frames context",              OFFSET(drm_device),   AV_OPT_TYPE_STRING, {.str = "/dev/dri/renderD128"}, 0, 0, DEC },
 
     { "list_formats", "list available formats and exit",                          OFFSET(list_format),  AV_OPT_TYPE_INT,    {.i64 = 0 },  0, INT_MAX, DEC, .unit = "list_formats" },
     { "all",          "show all available formats",                               OFFSET(list_format),  AV_OPT_TYPE_CONST,  {.i64 = V4L_ALLFORMATS  },    0, INT_MAX, DEC, .unit = "list_formats" },

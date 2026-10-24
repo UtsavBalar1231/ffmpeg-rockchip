@@ -1460,6 +1460,17 @@ Set the number of capture buffers to request from the driver. The driver may
 grant fewer. Each buffer holds one frame, so lower values reduce the memory
 pinned for high resolutions. Default is 256.
 
+@item dmabuf
+Export the capture buffers as DMA-BUF and output them as DRM PRIME hardware
+frames, so that hardware filters and encoders read the captured frames
+without a copy. Each frame holds its capture buffer until it is freed, and
+frames are dropped while all buffers are in use. Only raw formats with a
+single buffer per frame are supported. Requires libdrm. Default is 0.
+
+@item drm_device
+Set the DRM device that the hardware frames context of @option{dmabuf} is
+created on. Default is @file{/dev/dri/renderD128}.
+
 @end table
 
 @section vfwcap
