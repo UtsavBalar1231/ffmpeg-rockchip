@@ -102,6 +102,7 @@ typedef struct RKMPPEncContext {
     int                intra_refresh;
     int                refresh_mode;
     int                refresh_num;
+    int                max_slice_size;
 } RKMPPEncContext;
 
 static const AVRational mpp_tb = { 1, 1000000 };
@@ -140,6 +141,8 @@ static const AVRational mpp_tb = { 1, 1000000 };
         { "col", "Refresh by MB column", 0, AV_OPT_TYPE_CONST, { .i64 = MPP_ENC_RC_INTRA_REFRESH_COL }, 0, 0, VE, .unit = "refresh_mode" }, \
     { "refresh_num", "Set how many MB rows or columns refresh each time", OFFSET(refresh_num), AV_OPT_TYPE_INT, \
             { .i64 = 1 }, 1, INT_MAX, VE, "refresh_num" }, \
+    { "max_slice_size", "Encoded slice size in bytes after which a slice ends at the next MB or CTU", OFFSET(max_slice_size), AV_OPT_TYPE_INT, \
+            { .i64 = 0 }, 0, INT_MAX, VE }, \
 
 static const AVOption h264_options[] = {
     RKMPP_ENC_COMMON_OPTS

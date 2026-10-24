@@ -501,6 +501,48 @@ static int rkmpp_set_enc_cfg_prep(AVCodecContext *avctx, AVFrame *frame)
     return 0;
 }
 
+static int rkmpp_set_split_cfg(AVCodecContext *avctx, MppEncCfg cfg)
+{
+    RKMPPEncContext *r = avctx->priv_data;
+    MppEncSplitMode mode = MPP_ENC_SPLIT_NONE;
+    int arg = 0;
+
+    if (avctx->slices > 1 && r->max_slice_size > 0) {
+        av_log(avctx, AV_LOG_ERROR, "slices and max_slice_size cannot be used together\n");
+        return AVERROR(EINVAL);
+    }
+
+    if (r->max_slice_size > 0) {
+        mode = MPP_ENC_SPLIT_BY_BYTE;
+        arg  = r->max_slice_size;
+        av_log(avctx, AV_LOG_VERBOSE, "Slices are split at %d bytes\n", arg);
+    } else if (avctx->slices > 1) {
+        /* MPP counts 16x16 MBs for H.264 and CTUs for HEVC */
+        int ctu_size = 16, cols, rows, rows_per_slice;
+
+        if (avctx->codec_id == AV_CODEC_ID_HEVC &&
+            (mpp_enc_cfg_get_s32(cfg, "h265:lcu_size", &ctu_size) != MPP_OK ||
+             ctu_size <= 0))
+            ctu_size = 64;
+
+        cols = (avctx->width  + ctu_size - 1) / ctu_size;
+        rows = (avctx->height + ctu_size - 1) / ctu_size;
+        rows_per_slice = (rows + avctx->slices - 1) / avctx->slices;
+
+        mode = MPP_ENC_SPLIT_BY_CTU;
+        arg  = rows_per_slice * cols;
+        av_log(avctx, AV_LOG_VERBOSE, "Slices are split every %d rows of %dx%d blocks (%d slices)\n",
+               rows_per_slice, ctu_size, ctu_size, (rows + rows_per_slice - 1) / rows_per_slice);
+    }
+
+    if (mode != MPP_ENC_SPLIT_NONE) {
+        mpp_enc_cfg_set_u32(cfg, "split:mode", mode);
+        mpp_enc_cfg_set_u32(cfg, "split:arg", arg);
+    }
+
+    return 0;
+}
+
 static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
 {
     RKMPPEncContext *r = avctx->priv_data;
@@ -671,6 +713,9 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
                 av_log(avctx, AV_LOG_VERBOSE, "Requested to use Intra Refresh, "
                        "Mode/Num is set to %d/%d\n", r->refresh_mode, r->refresh_num);
             }
+
+            if ((ret = rkmpp_set_split_cfg(avctx, cfg)) < 0)
+                return ret;
         }
         break;
     case AV_CODEC_ID_MJPEG:
