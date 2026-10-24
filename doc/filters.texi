@@ -29135,6 +29135,46 @@ ffmpeg -hwaccel rkmpp -hwaccel_output_format drm_prime -i INPUT -vf drawbox_rkrg
 @end example
 @end itemize
 
+@section pixelize_rkrga
+
+Pixelize a region of the input video with the RGA mosaic, like
+@code{pixelize}.
+
+It accepts the following options:
+
+@table @option
+@item width, w
+@item height, h
+Set the block width and height. RGA blocks are square, so the two must be
+equal, and one of 8, 16, 32, 64 or 128. Default is 16.
+
+@item x
+@item y
+@item region_w
+@item region_h
+Set the region to pixelize, as expressions of the input size @var{in_w}
+(@var{iw}) and @var{in_h} (@var{ih}). Default is the whole frame.
+@code{pixelize} has no region options; its @option{w} and @option{h} are
+the block size, as here. On YUV formats the region is rounded down to even
+coordinates.
+@end table
+
+The options can be changed at runtime with a command. A block takes the
+value of its top left pixel, where @code{pixelize} takes the average, the
+minimum or the maximum, so it has no @option{mode} option. Blocks are laid
+from the region origin, and on NV12 a chroma block covers the luma block,
+as in @code{pixelize}. The @option{planes} option of
+@code{pixelize} is not supported.
+
+@subsection Examples
+@itemize
+@item
+Pixelize the top left quarter of decoded frames with 32 pixel blocks:
+@example
+ffmpeg -hwaccel rkmpp -hwaccel_output_format drm_prime -i INPUT -vf pixelize_rkrga=w=32:h=32:region_w=iw/2:region_h=ih/2 -c:v h264_rkmpp OUTPUT
+@end example
+@end itemize
+
 @c man end RKRGA VIDEO FILTERS
 
 @chapter VideoToolbox Video Filters
