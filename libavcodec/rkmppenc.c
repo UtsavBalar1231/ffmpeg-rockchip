@@ -46,6 +46,11 @@ static const char *const hevc_no_refresh_socs[] = {
     "rk3576", NULL,
 };
 
+/* SoCs whose H.264 encoder (VEPU510) never gets MPP's intra refresh band */
+static const char *const h264_roi_refresh_socs[] = {
+    "rk3576", NULL,
+};
+
 /* SoCs whose H.264/HEVC encoder (VEPU580) ignores MPP's MppEncROICfg */
 static const char *const no_roi_cfg_socs[] = {
     "rk3588", NULL,
@@ -1007,7 +1012,7 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
  * so once ROI is used every later frame gets its own config, empty or not.
  */
 static int rkmpp_prepare_roi(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame,
-                             const AVFrame *frame)
+                             const AVFrame *frame, const MppEncROIRegion *band)
 {
     RKMPPEncContext *r = avctx->priv_data;
     const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
@@ -1018,13 +1023,18 @@ static int rkmpp_prepare_roi(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame,
         if (!r->roi_warned)
             av_log(avctx, AV_LOG_WARNING, "ROI is not supported by this SoC's encoder, ignoring it\n");
         r->roi_warned = 1;
-        return 0;
+        sd = NULL;
     }
-    if (!sd && !r->roi_active)
+    if (!sd && !band && !r->roi_active)
         return 0;
 
     roi_cfg->number  = 0;
     roi_cfg->regions = mpp_enc_frame->roi_regions;
+
+    if (band) {
+        mpp_enc_frame->roi_regions[roi_cfg->number++] = *band;
+        r->roi_active = 1;
+    }
 
     if (sd) {
         const AVRegionOfInterest *roi = (const AVRegionOfInterest *)sd->data;
@@ -1084,6 +1094,44 @@ static int rkmpp_prepare_roi(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame,
     }
 
     return 0;
+}
+
+/*
+ * MPP's intra refresh schedule (mpp_enc_refs.c): from the second GOP on, the
+ * first refresh_len frames of each GOP refresh band k = frame % gop, and the
+ * first of them carries the headers again. Returns 1 with the band, two MB
+ * rows or columns wider towards the refreshed side as in MPP's HALs, where
+ * MPP's own band does not reach the encoder.
+ */
+static int rkmpp_get_refresh_band(AVCodecContext *avctx, const AVFrame *frame,
+                                  MPPEncFrame *mpp_enc_frame, MppEncROIRegion *band)
+{
+    RKMPPEncContext *r = avctx->priv_data;
+    const int gop = FFMAX(avctx->gop_size, 1);
+    const int unit = 16 * r->refresh_num;
+    const int size = r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ? avctx->height : avctx->width;
+    int idx, k, start, end;
+
+    if (frame->pict_type == AV_PICTURE_TYPE_I)
+        r->frame_idx = 0;
+    idx = r->frame_idx++;
+    k   = idx % gop;
+
+    if (!r->refresh_by_roi || idx < gop || k >= r->refresh_len)
+        return 0;
+
+    start = FFMAX(k * unit - (k ? 32 : 0), 0);
+    end   = FFMIN((k + 1) * unit, size);
+
+    *band = (MppEncROIRegion) {
+        .x     = r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ? 0 : start,
+        .y     = r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ? start : 0,
+        .w     = r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ? avctx->width : end - start,
+        .h     = r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ? end - start : avctx->height,
+        .intra = 1,
+    };
+
+    return 1;
 }
 
 static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
@@ -1301,7 +1349,11 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
 
     if (avctx->codec_id == AV_CODEC_ID_H264 ||
         avctx->codec_id == AV_CODEC_ID_HEVC) {
-        ret = rkmpp_prepare_roi(avctx, mpp_enc_frame, frame);
+        MppEncROIRegion band;
+        int has_band = avctx->codec_id == AV_CODEC_ID_H264 && r->intra_refresh &&
+                       rkmpp_get_refresh_band(avctx, frame, mpp_enc_frame, &band);
+
+        ret = rkmpp_prepare_roi(avctx, mpp_enc_frame, frame, has_band ? &band : NULL);
         if (ret < 0)
             goto exit;
     }
@@ -1655,6 +1707,16 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
                      avctx->codec_id == AV_CODEC_ID_HEVC) &&
                     rkmpp_soc_is_any(afbc_input_socs);
     r->roi_supported = !rkmpp_soc_is_any(no_roi_cfg_socs);
+
+    if (avctx->codec_id == AV_CODEC_ID_H264 && r->intra_refresh) {
+        int blocks = FFALIGN(r->refresh_mode == MPP_ENC_RC_INTRA_REFRESH_ROW ?
+                             avctx->height : avctx->width, 16) / 16;
+
+        r->refresh_len    = FFMIN((blocks + r->refresh_num - 1) / r->refresh_num,
+                                  FFMAX(avctx->gop_size, 1));
+        r->refresh_by_roi = rkmpp_soc_is_any(h264_roi_refresh_socs);
+        r->frame_idx      = 0;
+    }
 
     if ((ret = mpp_check_support_format(MPP_CTX_ENC, coding_type)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "MPP doesn't support encoding codec '%s' (%d)\n",

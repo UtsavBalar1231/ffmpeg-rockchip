@@ -102,6 +102,9 @@ typedef struct RKMPPEncContext {
     int                intra_refresh;
     int                refresh_mode;
     int                refresh_num;
+    int                refresh_len;
+    int                refresh_by_roi;
+    int                frame_idx;
     int                max_slice_size;
     int                temporal_layers;
     int                ltr_interval;
