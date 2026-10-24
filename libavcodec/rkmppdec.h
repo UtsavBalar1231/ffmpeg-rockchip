@@ -81,11 +81,20 @@ typedef struct RKMPPDecContext {
     int64_t        iep_last_pts;
     RKMPPPacketProps pkt_props[PKT_PROPS_SLOTS];
     int            pkt_props_next;
+    /* layout MPP reports for the downscaled output, set at info change */
+    int            tbn_active;
+    MppFrameFormat tbn_fmt;
+    RK_U32         tbn_width;
+    RK_U32         tbn_height;
+    RK_U32         tbn_hor_stride;
+    RK_U32         tbn_ver_stride;
+    size_t         tbn_buf_size;
 
     int            deint;
     int            afbc;
     int            fast_parse;
     int            buf_mode;
+    int            thumbnail;
 } RKMPPDecContext;
 
 enum {
@@ -120,6 +129,7 @@ static const AVOption options[] = {
     { "buf_mode",   "Set the buffer mode for MPP decoder", OFFSET(buf_mode), AV_OPT_TYPE_INT, { .i64 = RKMPP_DEC_HALF_INTERNAL }, 0, 1, VD, .unit = "buf_mode" },
         { "half",   "Half internal mode",                      0, AV_OPT_TYPE_CONST, { .i64 = RKMPP_DEC_HALF_INTERNAL }, 0, 0, VD, .unit = "buf_mode" },
         { "ext",    "Pure external mode",                      0, AV_OPT_TYPE_CONST, { .i64 = RKMPP_DEC_PURE_EXTERNAL }, 0, 0, VD, .unit = "buf_mode" },
+    { "thumbnail",  "Output only a copy downscaled by 2 in each dimension (H.264, HEVC, VP9, AV1)", OFFSET(thumbnail), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, VD },
     { NULL }
 };
 

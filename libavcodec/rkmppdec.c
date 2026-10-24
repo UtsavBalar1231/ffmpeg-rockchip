@@ -197,6 +197,55 @@ static av_cold int rkmpp_decode_close(AVCodecContext *avctx)
     return 0;
 }
 
+/* Only the VDPU38x HALs of these codecs keep full size references aside
+ * and write the half size picture alone to the output buffer. */
+static av_cold int rkmpp_enable_thumbnail(AVCodecContext *avctx)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+    MppDecCfg cfg = NULL;
+    int ret;
+
+    switch (avctx->codec_id) {
+    case AV_CODEC_ID_H264:
+    case AV_CODEC_ID_HEVC:
+    case AV_CODEC_ID_VP9:
+    case AV_CODEC_ID_AV1:
+        break;
+    default:
+        av_log(avctx, AV_LOG_WARNING, "Thumbnail output is not supported in codec '%s', ignoring\n",
+               avcodec_get_name(avctx->codec_id));
+        r->thumbnail = 0;
+        return 0;
+    }
+
+    if ((ret = mpp_dec_cfg_init(&cfg)) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to init decoder config: %d\n", ret);
+        return AVERROR_EXTERNAL;
+    }
+    if ((ret = r->mapi->control(r->mctx, MPP_DEC_GET_CFG, cfg)) != MPP_OK ||
+        (ret = mpp_dec_cfg_set_u32(cfg, "base:enable_thumbnail", MPP_FRAME_THUMBNAIL_ONLY)) != MPP_OK ||
+        (ret = r->mapi->control(r->mctx, MPP_DEC_SET_CFG, cfg)) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to enable thumbnail output: %d\n", ret);
+        ret = AVERROR_EXTERNAL;
+    }
+    mpp_dec_cfg_deinit(cfg);
+    if (ret < 0)
+        return ret;
+
+    /* IEP, AFBC and committed buffers would all assume the full size layout */
+    if (r->deint)
+        av_log(avctx, AV_LOG_VERBOSE, "Deinterlacing is disabled with thumbnail output\n");
+    if (r->afbc)
+        av_log(avctx, AV_LOG_VERBOSE, "AFBC is disabled with thumbnail output\n");
+    if (r->buf_mode != RKMPP_DEC_HALF_INTERNAL)
+        av_log(avctx, AV_LOG_VERBOSE, "Half internal buffer mode is used with thumbnail output\n");
+    r->deint    = 0;
+    r->afbc     = RKMPP_DEC_AFBC_OFF;
+    r->buf_mode = RKMPP_DEC_HALF_INTERNAL;
+
+    return 0;
+}
+
 static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
 {
     RKMPPDecContext *r = avctx->priv_data;
@@ -325,6 +374,9 @@ static av_cold int rkmpp_decode_init(AVCodecContext *avctx)
             goto fail;
         }
     }
+
+    if (r->thumbnail && (ret = rkmpp_enable_thumbnail(avctx)) < 0)
+        goto fail;
 
     if (avctx->skip_frame == AVDISCARD_NONKEY && r->deint) {
         av_log(avctx, AV_LOG_VERBOSE, "Deinterlacing is disabled when skipping non-key frames\n");
@@ -741,6 +793,52 @@ static int frame_create_buf(AVFrame *frame,
     return AVERROR(EINVAL);
 }
 
+/* MPP hands out the downscaled frames with the full size layout and only
+ * rewrites a frame passed to MPP_DEC_GET_THUMBNAIL_FRAME_INFO */
+static int rkmpp_setup_thumbnail(AVCodecContext *avctx, MppFrame mpp_frame)
+{
+    RKMPPDecContext *r = avctx->priv_data;
+    int ret;
+
+    r->tbn_active = 0;
+    if (!r->thumbnail)
+        return 0;
+
+    if (mpp_frame_get_thumbnail_en(mpp_frame) != MPP_FRAME_THUMBNAIL_ONLY) {
+        av_log(avctx, AV_LOG_WARNING, "The decoder cannot downscale, outputting full size frames\n");
+        return 0;
+    }
+
+    if ((ret = r->mapi->control(r->mctx, MPP_DEC_GET_THUMBNAIL_FRAME_INFO, mpp_frame)) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to get thumbnail frame info: %d\n", ret);
+        return AVERROR_EXTERNAL;
+    }
+
+    r->tbn_fmt        = mpp_frame_get_fmt(mpp_frame);
+    r->tbn_width      = mpp_frame_get_width(mpp_frame);
+    r->tbn_height     = mpp_frame_get_height(mpp_frame);
+    r->tbn_hor_stride = mpp_frame_get_hor_stride(mpp_frame);
+    r->tbn_ver_stride = mpp_frame_get_ver_stride(mpp_frame);
+    r->tbn_buf_size   = mpp_frame_get_buf_size(mpp_frame);
+    r->tbn_active     = 1;
+
+    return 0;
+}
+
+static void rkmpp_apply_thumbnail(RKMPPDecContext *r, MppFrame mpp_frame)
+{
+    if (!r->tbn_active ||
+        mpp_frame_get_thumbnail_en(mpp_frame) != MPP_FRAME_THUMBNAIL_ONLY)
+        return;
+
+    mpp_frame_set_fmt(mpp_frame, r->tbn_fmt);
+    mpp_frame_set_width(mpp_frame, r->tbn_width);
+    mpp_frame_set_height(mpp_frame, r->tbn_height);
+    mpp_frame_set_hor_stride(mpp_frame, r->tbn_hor_stride);
+    mpp_frame_set_ver_stride(mpp_frame, r->tbn_ver_stride);
+    mpp_frame_set_buf_size(mpp_frame, r->tbn_buf_size);
+}
+
 static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mpp_frame)
 {
     RKMPPDecContext *r = avctx->priv_data;
@@ -755,6 +853,8 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
 
     if (!frame || !mpp_frame)
         return AVERROR(ENOMEM);
+
+    rkmpp_apply_thumbnail(r, mpp_frame);
 
     mpp_buf = mpp_frame_get_buffer(mpp_frame);
     if (!mpp_buf)
@@ -1043,12 +1143,16 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
         char *opts = NULL;
         int fast_parse = r->fast_parse;
         int mpp_frame_mode = mpp_frame_get_mode(mpp_frame);
-        const MppFrameFormat mpp_fmt = mpp_frame_get_fmt(mpp_frame);
+        MppFrameFormat mpp_fmt;
         enum AVPixelFormat pix_fmts[3] = { AV_PIX_FMT_DRM_PRIME,
                                            AV_PIX_FMT_NONE,
                                            AV_PIX_FMT_NONE };
 
         av_log(avctx, AV_LOG_VERBOSE, "Noticed an info change\n");
+
+        if ((ret = rkmpp_setup_thumbnail(avctx, mpp_frame)) < 0)
+            goto info_change_fail;
+        mpp_fmt = mpp_frame_get_fmt(mpp_frame);
 
         if (r->afbc && !(mpp_fmt & MPP_FRAME_FBC_MASK)) {
             av_log(avctx, AV_LOG_VERBOSE, "AFBC is requested but not supported\n");
