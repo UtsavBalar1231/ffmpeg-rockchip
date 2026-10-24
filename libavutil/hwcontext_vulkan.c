@@ -1962,8 +1962,14 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
         return AVERROR_EXTERNAL;
     }
 
+    /* Frames export timeline semaphores, which drivers may not export like
+     * binary ones */
     ext_sem_props_info = (VkPhysicalDeviceExternalSemaphoreInfo) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+        .pNext = &(VkSemaphoreTypeCreateInfo) {
+            .sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+            .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+        },
     };
 
     /* Opaque FD semaphore properties */
