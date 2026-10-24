@@ -57,6 +57,7 @@ static MppCodingType rkmpp_get_coding_type(AVCodecContext *avctx)
     case AV_CODEC_ID_MPEG2VIDEO:    return MPP_VIDEO_CodingMPEG2;
     case AV_CODEC_ID_MPEG4:         return MPP_VIDEO_CodingMPEG4;
     case AV_CODEC_ID_MJPEG:         return MPP_VIDEO_CodingMJPEG;
+    case AV_CODEC_ID_AVS2:          return MPP_VIDEO_CodingAVS2;
     default:                        return MPP_VIDEO_CodingUnused;
     }
 }
@@ -432,6 +433,7 @@ static int rkmpp_set_buffer_group(AVCodecContext *avctx,
     switch (avctx->codec_id) {
     case AV_CODEC_ID_H264:
     case AV_CODEC_ID_HEVC:
+    case AV_CODEC_ID_AVS2:
         decoder_pool_size = 20;
         break;
     default:
@@ -1055,6 +1057,15 @@ static int rkmpp_get_frame(AVCodecContext *avctx, AVFrame *frame, int timeout)
             r->afbc = 0;
         }
 
+        /* the AVS2 parser does not set the format, so this is the first
+         * point where a 10-bit stream shows */
+        if (avctx->codec_id == AV_CODEC_ID_AVS2 &&
+            (mpp_fmt & MPP_FRAME_FMT_MASK) != MPP_FMT_YUV420SP) {
+            av_log(avctx, AV_LOG_ERROR, "AVS2 Main10 is not supported, only 8-bit 4:2:0\n");
+            ret = AVERROR_PATCHWELCOME;
+            goto info_change_fail;
+        }
+
         pix_fmts[1] = rkmpp_get_av_format(mpp_fmt & MPP_FRAME_FMT_MASK);
         if (pix_fmts[1] == AV_PIX_FMT_NONE) {
             av_log(avctx, AV_LOG_ERROR, "Unsupported MPP frame format: 0x%x\n",
@@ -1624,4 +1635,7 @@ DEFINE_RKMPP_DECODER(mpeg4, MPEG4, "dump_extra,mpeg4_unpack_bframes")
 #endif
 #if CONFIG_MJPEG_RKMPP_DECODER
 DEFINE_RKMPP_DECODER(mjpeg, MJPEG, NULL)
+#endif
+#if CONFIG_AVS2_RKMPP_DECODER
+DEFINE_RKMPP_DECODER(avs2, AVS2, NULL)
 #endif
