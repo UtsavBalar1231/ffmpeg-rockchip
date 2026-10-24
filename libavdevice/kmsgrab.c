@@ -160,6 +160,7 @@ static int kmsgrab_get_fb2(AVFormatContext *avctx,
                            AVDRMFrameDescriptor *desc)
 {
     KMSGrabContext *ctx = avctx->priv_data;
+    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(ctx->format);
     drmModeFB2 *fb;
     int err, i, nb_objects;
     uint64_t modifier = ctx->drm_format_modifier;
@@ -204,9 +205,11 @@ static int kmsgrab_get_fb2(AVFormatContext *avctx,
     nb_objects = 0;
     for (i = 0; i < 4 && fb->handles[i]; i++) {
         size_t size;
-        int dup = 0, j, obj;
+        int dup = 0, j, obj, height = fb->height;
 
-        size = fb->offsets[i] + fb->height * fb->pitches[i];
+        if (i > 0 && pix_desc && !(pix_desc->flags & AV_PIX_FMT_FLAG_RGB))
+            height = AV_CEIL_RSHIFT((int)fb->height, pix_desc->log2_chroma_h);
+        size = fb->offsets[i] + (size_t)height * fb->pitches[i];
 
         for (j = 0; j < i; j++) {
             if (fb->handles[i] == fb->handles[j]) {
