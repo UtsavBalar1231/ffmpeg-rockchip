@@ -301,6 +301,55 @@ ffmpeg -re -i INPUT -c:v rawvideo -pix_fmt bgra -f fbdev /dev/fb0
 
 See also @url{http://linux-fbdev.sourceforge.net/}, and fbset(1).
 
+@section kms
+
+KMS (kernel mode setting) video output device.
+
+Shows the video on a plane of a DRM device with atomic mode setting. The
+output name is the device path, or the name of a DRM driver, such as
+@code{rockchip}, to use the first device of that driver; it defaults to
+@file{/dev/dri/card0}. DRM PRIME frames,
+such as those of hardware decoders, are shown without a copy; software frames
+are copied into dumb buffers. Each frame is shown at the next vertical blank,
+so use @option{-re} to play a file at its own rate.
+
+The device must become the DRM master, so no display server may be running
+on the DRM device. If the CRTC is not active, the preferred mode of the
+connector is set.
+
+Requires libdrm.
+
+@subsection Options
+@table @option
+@item connector_id
+Set the connector to show the video on. Default is 0, which picks the first
+connected connector.
+
+@item crtc_id
+Set the CRTC that drives the connector. Default is 0, which picks the CRTC
+currently driving the connector, or else the first one that can.
+
+@item plane_id
+Set the plane to show the video on. Default is 0, which picks the first
+primary plane, or else the first overlay plane, of the CRTC that supports
+the frame format and modifier.
+
+@item scale
+Scale the video to fit the display, keeping its aspect ratio. If the plane
+cannot scale the video, it is shown unscaled and centred. Default is 1.
+@end table
+
+@subsection Examples
+Decode a file with a hardware decoder and show it:
+@example
+ffmpeg -re -c:v h264_rkmpp -i INPUT -f kms rockchip
+@end example
+
+Show a software decoded file:
+@example
+ffmpeg -re -i INPUT -pix_fmt nv12 -f kms /dev/dri/card0
+@end example
+
 @section oss
 
 OSS (Open Sound System) output device.
