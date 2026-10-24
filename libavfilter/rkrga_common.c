@@ -1169,6 +1169,7 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     const char *rga_ver = querystring(RGA_VERSION);
 
     r->got_frame = 0;
+    r->jobs      = param->jobs;
 
     r->has_rga2  = !!strstr(rga_ver, "RGA_2");
     r->has_rga2l = !!strstr(rga_ver, "RGA_2_lite");
@@ -1280,6 +1281,10 @@ av_cold int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param)
     ret = fill_rga_frame_info_by_link(avctx, &r->out_rga_frame_info, avctx->outputs[0], 0, 0);
     if (ret < 0)
         goto fail;
+
+    /* Colour fill and mosaic are RGA2 features */
+    if (r->jobs)
+        r->is_rga2_used = 1;
 
     /* Pre-check RGAFrameInfo */
     ret = verify_rga_frame_info(avctx, &r->in_rga_frame_infos[0],
@@ -1485,22 +1490,12 @@ static int call_rkrga_blit(AVFilterContext *avctx,
     return 0;
 }
 
-int ff_rkrga_filter_frame(RKRGAContext *r,
-                          AVFilterLink *inlink_src, AVFrame *picref_src,
-                          AVFilterLink *inlink_pat, AVFrame *picref_pat)
+static int rga_drain_output(RKRGAContext *r, AVFilterContext *ctx)
 {
-    AVFilterContext  *ctx = inlink_src->dst;
     AVFilterLink *outlink = ctx->outputs[0];
     RGAAsyncFrame aframe;
-    RGAFrame *src_frame = NULL;
-    RGAFrame *dst_frame = NULL;
-    RGAFrame *pat_frame = NULL;
-    int ret, filter_ret;
-    int do_overlay = ctx->nb_inputs > 1 &&
-                     r->is_overlay_offset_valid &&
-                     inlink_pat && picref_pat;
+    int filter_ret;
 
-    /* Sync & Drain */
     while (r->eof && av_fifo_read(r->async_fifo, &aframe, 1) >= 0) {
         if (rga_sync_frame(&aframe) < 0)
             av_log(ctx, AV_LOG_WARNING, "RGA sync failed\n");
@@ -1512,6 +1507,57 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
             return filter_ret;
         r->got_frame = 1;
     }
+
+    return 0;
+}
+
+static int rga_queue_output(RKRGAContext *r, AVFilterContext *ctx, RGAAsyncFrame *aframe)
+{
+    AVFilterLink *outlink = ctx->outputs[0];
+    int ret, filter_ret;
+
+    aframe->dst->queued++;
+    set_rga_async_frame_lock_status(aframe, 1);
+    av_fifo_write(r->async_fifo, aframe, 1);
+
+    /* Sync & Retrieve */
+    if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
+        av_fifo_read(r->async_fifo, aframe, 1);
+        if ((ret = rga_sync_frame(aframe)) < 0) {
+            av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
+            aframe->dst->queued--;
+            return ret;
+        }
+
+        filter_ret = r->filter_frame(outlink, aframe->dst->frame);
+        aframe->dst->frame = NULL;
+        aframe->dst->queued--;
+        if (filter_ret < 0)
+            return filter_ret;
+        r->got_frame = 1;
+    }
+
+    return 0;
+}
+
+int ff_rkrga_filter_frame(RKRGAContext *r,
+                          AVFilterLink *inlink_src, AVFrame *picref_src,
+                          AVFilterLink *inlink_pat, AVFrame *picref_pat)
+{
+    AVFilterContext  *ctx = inlink_src->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    RGAAsyncFrame aframe;
+    RGAFrame *src_frame = NULL;
+    RGAFrame *dst_frame = NULL;
+    RGAFrame *pat_frame = NULL;
+    int ret;
+    int do_overlay = ctx->nb_inputs > 1 &&
+                     r->is_overlay_offset_valid &&
+                     inlink_pat && picref_pat;
+
+    /* Sync & Drain */
+    if ((ret = rga_drain_output(r, ctx)) < 0)
+        return ret;
 
     if (!picref_src)
         return 0;
@@ -1586,27 +1632,190 @@ int ff_rkrga_filter_frame(RKRGAContext *r,
     if (ret < 0)
         return ret;
 
-    dst_frame->queued++;
     aframe = (RGAAsyncFrame){ src_frame, dst_frame, pat_frame };
-    set_rga_async_frame_lock_status(&aframe, 1);
-    av_fifo_write(r->async_fifo, &aframe, 1);
+    return rga_queue_output(r, ctx, &aframe);
+}
 
-    /* Sync & Retrieve */
-    if (av_fifo_can_read(r->async_fifo) > r->async_depth) {
-        av_fifo_read(r->async_fifo, &aframe, 1);
-        if ((ret = rga_sync_frame(&aframe)) < 0) {
-            av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
-            aframe.dst->queued--;
-            return ret;
-        }
+static rga_buffer_t job_check_buffer(const RGAFrameInfo *info)
+{
+    int ws = FFALIGN(info->act_w, 16);
 
-        filter_ret = r->filter_frame(outlink, aframe.dst->frame);
-        aframe.dst->frame = NULL;
-        aframe.dst->queued--;
-        if (filter_ret < 0)
-            return filter_ret;
-        r->got_frame = 1;
+    return wrapbuffer_fd_t(-1, info->act_w, info->act_h, ws, info->act_h, info->rga_fmt);
+}
+
+int ff_rkrga_check_job(AVFilterContext *avctx, const RKRGAJob *job)
+{
+    RKRGAContext *r = avctx->priv;
+    rga_buffer_t src = { 0 }, dst, pat = { 0 };
+    im_rect srect = { 0 }, prect = { 0 };
+    IM_STATUS status;
+
+    dst = job_check_buffer(&r->out_rga_frame_info);
+    switch (job->src) {
+    case RKRGA_JOB_SRC_DST:  src = dst;                                          break;
+    case RKRGA_JOB_SRC_MAIN: src = job_check_buffer(&r->in_rga_frame_infos[0]); break;
+    default: break;
+    }
+    if (job->src != RKRGA_JOB_SRC_NONE)
+        srect = job->rect;
+
+    status = imcheck_t(src, dst, pat, srect, job->rect, prect, job->usage);
+    if (status != IM_STATUS_NOERROR) {
+        av_log(avctx, AV_LOG_ERROR, "RGA cannot run this operation on '%s': %s\n",
+               av_get_pix_fmt_name(r->out_rga_frame_info.pix_fmt), imStrError_t(status));
+        return AVERROR(ENOSYS);
     }
 
     return 0;
+}
+
+static int call_rkrga_job(AVFilterContext *avctx, const RKRGAJob *job,
+                          const rga_info_t *src_info, const rga_info_t *dst_info,
+                          int *release_fence_fd)
+{
+    rga_buffer_t src = { 0 }, dst, pat = { 0 };
+    im_rect srect = { 0 }, prect = { 0 };
+    im_opt_t opt = { .version = RGA_CURRENT_API_HEADER_VERSION };
+    IM_STATUS status;
+    int fence_fd = -1;
+
+    dst = info_to_im_buffer(dst_info);
+    if (src_info) {
+        src   = info_to_im_buffer(src_info);
+        srect = job->rect;
+    }
+
+    opt.color          = job->color;
+    opt.colorkey_range = job->colorkey_range;
+    opt.mosaic_mode    = job->mosaic_mode;
+    opt.priority       = dst_info->priority;
+    opt.core           = dst_info->core;
+
+    av_log(avctx, AV_LOG_DEBUG, "RGA job usage:0x%x x:%d y:%d w:%d h:%d core:0x%x\n",
+           job->usage, job->rect.x, job->rect.y, job->rect.width, job->rect.height, opt.core);
+
+    status = improcessOpt(src, dst, pat, srect, job->rect, prect,
+                          -1, &fence_fd, &opt, job->usage | IM_ASYNC);
+    if (status != IM_STATUS_SUCCESS) {
+        av_log(avctx, AV_LOG_ERROR, "RGA job failed: %s\n", imStrError_t(status));
+        return AVERROR_EXTERNAL;
+    }
+    if (fence_fd <= 0) {
+        av_log(avctx, AV_LOG_ERROR, "RGA async job returned invalid fence_fd: %d\n", fence_fd);
+        return AVERROR_EXTERNAL;
+    }
+
+    *release_fence_fd = fence_fd;
+    return 0;
+}
+
+int ff_rkrga_filter_frame_jobs(RKRGAContext *r, AVFilterLink *inlink, AVFrame *picref,
+                               const RKRGAJob *jobs, int nb_jobs, int copy_main)
+{
+    AVFilterContext  *ctx = inlink->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    RGAAsyncFrame aframe;
+    RGAFrame *src_frame = NULL;
+    RGAFrame *dst_frame = NULL;
+    int fence_fd = -1;
+    int i, ret;
+
+    if ((ret = rga_drain_output(r, ctx)) < 0)
+        return ret;
+
+    if (!picref)
+        return 0;
+
+    if (!(src_frame = submit_frame(r, inlink, picref, 0, 0))) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to submit frame on input: %d\n",
+               FF_INLINK_IDX(inlink));
+        return AVERROR(ENOMEM);
+    }
+
+    /* A new frame: frames on the output link must be in its frames context */
+    if (!(dst_frame = query_frame(r, outlink, src_frame->frame, NULL, 0))) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to query an output frame\n");
+        return AVERROR(ENOMEM);
+    }
+    if (copy_main) {
+        if ((ret = call_rkrga_blit(ctx, &src_frame->info, &dst_frame->info, NULL)) < 0)
+            return ret;
+        fence_fd = dst_frame->info.out_fence_fd;
+    }
+
+    for (i = 0; i < nb_jobs; i++) {
+        const rga_info_t *src_info = NULL;
+
+        switch (jobs[i].src) {
+        case RKRGA_JOB_SRC_DST:  src_info = &dst_frame->info; break;
+        case RKRGA_JOB_SRC_MAIN: src_info = &src_frame->info; break;
+        default: break;
+        }
+
+        /* A job submitted with the previous job's fence as its acquire fence
+         * leaves no trace in the output on RK3576, so wait on the CPU */
+        if (fence_fd > 0) {
+            if (imsync(fence_fd) != IM_STATUS_SUCCESS) {
+                close(fence_fd);
+                av_log(ctx, AV_LOG_ERROR, "RGA sync failed\n");
+                return AVERROR_EXTERNAL;
+            }
+            fence_fd = -1;
+        }
+
+        ret = call_rkrga_job(ctx, &jobs[i], src_info, &dst_frame->info, &fence_fd);
+        if (ret < 0)
+            return ret;
+    }
+    dst_frame->info.out_fence_fd = fence_fd;
+
+    aframe = (RGAAsyncFrame){ src_frame, dst_frame, NULL };
+    return rga_queue_output(r, ctx, &aframe);
+}
+
+int ff_rkrga_activate_jobs(AVFilterContext *avctx,
+                           int (*filter_frame)(AVFilterContext *avctx, AVFrame *in))
+{
+    RKRGAContext      *r = avctx->priv;
+    AVFilterLink  *inlink = avctx->inputs[0];
+    AVFilterLink *outlink = avctx->outputs[0];
+    AVFrame *in = NULL;
+    int ret, at_eof = r->eof, status = 0;
+    int64_t pts = AV_NOPTS_VALUE;
+
+    FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+    if (!at_eof) {
+        ret = ff_inlink_consume_frame(inlink, &in);
+        if (ret < 0)
+            return ret;
+
+        if (ff_inlink_acknowledge_status(inlink, &status, &pts) && status == AVERROR_EOF)
+            at_eof = 1;
+    }
+
+    if (in) {
+        ret = filter_frame(avctx, in);
+        if (ret < 0)
+            return ret;
+
+        if (r->got_frame && !at_eof) {
+            r->got_frame = 0;
+            return 0;
+        }
+    }
+
+    if (at_eof) {
+        r->eof = 1;
+        ret = filter_frame(avctx, NULL);
+        if (ret < 0)
+            return ret;
+
+        pts = av_rescale_q(pts, inlink->time_base, outlink->time_base);
+        ff_outlink_set_status(outlink, AVERROR_EOF, pts);
+        return 0;
+    }
+
+    FF_FILTER_FORWARD_WANTED(outlink, inlink);
+    return FFERROR_NOT_READY;
 }

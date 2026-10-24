@@ -95,6 +95,7 @@ typedef struct RKRGAContext {
     int has_rga2e;
     int has_rga2p;
     int has_rga3;
+    int jobs;
     int is_rga2_used;
     int is_overlay_offset_valid;
     int csc_warned;
@@ -123,12 +124,49 @@ typedef struct RKRGAParam {
 
     int overlay_x;
     int overlay_y;
+
+    /* The filter submits RKRGAJobs on frames of the input size and format */
+    int jobs;
 } RKRGAParam;
+
+enum RKRGAJobSrc {
+    RKRGA_JOB_SRC_NONE,
+    RKRGA_JOB_SRC_DST,
+    RKRGA_JOB_SRC_MAIN,
+};
+
+typedef struct RKRGAJob {
+    int               usage;
+    enum RKRGAJobSrc  src;
+    im_rect           rect;
+    int               color;
+    int               mosaic_mode;
+    im_colorkey_range colorkey_range;
+} RKRGAJob;
 
 int ff_rkrga_init(AVFilterContext *avctx, RKRGAParam *param);
 int ff_rkrga_close(AVFilterContext *avctx);
 int ff_rkrga_filter_frame(RKRGAContext *r,
                           AVFilterLink *inlink_src, AVFrame *picref_src,
                           AVFilterLink *inlink_pat, AVFrame *picref_pat);
+
+/**
+ * Check at configuration time that RGA can run a job on the output.
+ */
+int ff_rkrga_check_job(AVFilterContext *avctx, const RKRGAJob *job);
+
+/**
+ * Run jobs on a new output frame. With copy_main the output starts as a copy
+ * of the main input, otherwise undefined. A NULL main frame drains at EOF.
+ */
+int ff_rkrga_filter_frame_jobs(RKRGAContext *r, AVFilterLink *inlink, AVFrame *picref,
+                               const RKRGAJob *jobs, int nb_jobs, int copy_main);
+
+/**
+ * activate() for a single-input job filter. filter_frame takes ownership of
+ * the frame; it is called with NULL to drain at EOF.
+ */
+int ff_rkrga_activate_jobs(AVFilterContext *avctx,
+                           int (*filter_frame)(AVFilterContext *avctx, AVFrame *in));
 
 #endif /* AVFILTER_RKRGA_COMMON_H */
