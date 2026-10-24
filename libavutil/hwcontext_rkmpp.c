@@ -597,15 +597,198 @@ fail:
     return err;
 }
 
+static uint32_t rkmpp_drm_plane_format(const AVPixFmtDescriptor *pixdesc, int plane)
+{
+    int nb_comps = 0, step = 0;
+
+    for (int i = 0; i < pixdesc->nb_components; i++) {
+        if (pixdesc->comp[i].plane == plane) {
+            step = pixdesc->comp[i].step;
+            nb_comps++;
+        }
+    }
+
+    if (nb_comps == 1 && step == 1)
+        return DRM_FORMAT_R8;
+    if (nb_comps == 1 && step == 2)
+        return DRM_FORMAT_R16;
+    if (nb_comps == 2 && step == 2)
+        return DRM_FORMAT_GR88;
+    if (nb_comps == 2 && step == 4)
+        return DRM_FORMAT_GR1616;
+    return 0;
+}
+
+static void rkmpp_unmap_drm(AVHWFramesContext *hwfc, HWMapDescriptor *hwmap)
+{
+    av_free(hwmap->priv);
+}
+
+static int rkmpp_map_to_drm(AVHWFramesContext *hwfc, AVFrame *dst,
+                            const AVFrame *src, int flags)
+{
+    const AVDRMFrameDescriptor *src_desc = (AVDRMFrameDescriptor *)src->data[0];
+    const AVDRMLayerDescriptor *layer = &src_desc->layers[0];
+    const AVPixFmtDescriptor *pixdesc = av_pix_fmt_desc_get(hwfc->sw_format);
+    AVDRMFrameDescriptor *desc;
+    int err, i;
+
+    desc = av_memdup(src_desc, sizeof(*desc));
+    if (!desc)
+        return AVERROR(ENOMEM);
+
+    /* Export each plane as its own layer, as VA-API does: Vulkan imports
+     * multi-planar YUV only in that form */
+    if (src_desc->nb_layers == 1 && layer->nb_planes > 1 &&
+        src_desc->objects[0].format_modifier == DRM_FORMAT_MOD_LINEAR &&
+        !(pixdesc->flags & (AV_PIX_FMT_FLAG_BITSTREAM | AV_PIX_FMT_FLAG_BE |
+                            AV_PIX_FMT_FLAG_RGB))) {
+        for (i = 0; i < layer->nb_planes; i++)
+            if (!rkmpp_drm_plane_format(pixdesc, i))
+                break;
+
+        if (i == layer->nb_planes) {
+            desc->nb_layers = layer->nb_planes;
+            for (i = 0; i < layer->nb_planes; i++) {
+                desc->layers[i].format    = rkmpp_drm_plane_format(pixdesc, i);
+                desc->layers[i].nb_planes = 1;
+                desc->layers[i].planes[0] = layer->planes[i];
+            }
+        }
+    }
+
+    err = ff_hwframe_map_create(src->hw_frames_ctx, dst, src,
+                                &rkmpp_unmap_drm, desc);
+    if (err < 0) {
+        av_free(desc);
+        return err;
+    }
+
+    dst->data[0] = (uint8_t *)desc;
+    dst->width   = src->width;
+    dst->height  = src->height;
+
+    return 0;
+}
+
+static int rkmpp_map_from_drm(AVHWFramesContext *hwfc, AVFrame *dst,
+                              const AVFrame *src, int flags)
+{
+    const AVDRMFrameDescriptor *src_desc = (AVDRMFrameDescriptor *)src->data[0];
+    AVRKMPPDRMFrameDescriptor *desc;
+    AVDRMLayerDescriptor *layer;
+    int err, i;
+
+    desc = av_mallocz(sizeof(*desc));
+    if (!desc)
+        return AVERROR(ENOMEM);
+    desc->drm_desc = *src_desc;
+
+    /* RKMPP users read all planes from the first layer */
+    if (src_desc->nb_layers > 1) {
+        layer = &desc->drm_desc.layers[0];
+        layer->nb_planes = 0;
+        for (i = 0; i < FF_ARRAY_ELEMS(supported_formats); i++) {
+            if (supported_formats[i].pixfmt == hwfc->sw_format) {
+                layer->format = supported_formats[i].drm_format;
+                break;
+            }
+        }
+        for (i = 0; i < src_desc->nb_layers; i++) {
+            if (src_desc->layers[i].nb_planes != 1) {
+                av_log(hwfc, AV_LOG_ERROR, "Cannot map DRM layer %d with %d "
+                       "planes to RKMPP.\n", i, src_desc->layers[i].nb_planes);
+                av_free(desc);
+                return AVERROR(EINVAL);
+            }
+            layer->planes[layer->nb_planes++] = src_desc->layers[i].planes[0];
+        }
+        desc->drm_desc.nb_layers = 1;
+    }
+
+    err = ff_hwframe_map_create(dst->hw_frames_ctx, dst, src,
+                                &rkmpp_unmap_drm, desc);
+    if (err < 0) {
+        av_free(desc);
+        return err;
+    }
+
+    dst->data[0] = (uint8_t *)desc;
+    dst->width   = src->width;
+    dst->height  = src->height;
+
+    return 0;
+}
+
+static int rkmpp_frames_ctx_is_drm(const AVBufferRef *frames_ref)
+{
+    const AVHWFramesContext *fc;
+
+    if (!frames_ref)
+        return 0;
+    fc = (const AVHWFramesContext *)frames_ref->data;
+    return fc->device_ctx->type == AV_HWDEVICE_TYPE_DRM;
+}
+
+static int rkmpp_map_to(AVHWFramesContext *hwfc, AVFrame *dst,
+                        const AVFrame *src, int flags)
+{
+    int err;
+
+    if (src->format != AV_PIX_FMT_DRM_PRIME ||
+        !rkmpp_frames_ctx_is_drm(src->hw_frames_ctx))
+        return AVERROR(ENOSYS);
+
+    err = rkmpp_map_from_drm(hwfc, dst, src, flags);
+    if (err)
+        return err;
+
+    return av_frame_copy_props(dst, src);
+}
+
+/* Vulkan imports the DRM frame directly, but needs the per-plane layers */
+static int rkmpp_map_to_vulkan(AVHWFramesContext *hwfc, AVFrame *dst,
+                               const AVFrame *src, int flags)
+{
+    AVFrame *tmp;
+    int err;
+
+    tmp = av_frame_alloc();
+    if (!tmp)
+        return AVERROR(ENOMEM);
+    tmp->format = AV_PIX_FMT_DRM_PRIME;
+
+    err = rkmpp_map_to_drm(hwfc, tmp, src, flags);
+    if (err < 0)
+        goto fail;
+
+    err = av_hwframe_map(dst, tmp, flags);
+    if (err < 0)
+        goto fail;
+
+    err = ff_hwframe_map_replace(dst, src);
+
+fail:
+    av_frame_free(&tmp);
+    return err;
+}
+
 static int rkmpp_map_from(AVHWFramesContext *hwfc, AVFrame *dst,
                           const AVFrame *src, int flags)
 {
     int err;
 
-    if (hwfc->sw_format != dst->format)
+    if (dst->format == AV_PIX_FMT_DRM_PRIME) {
+        if (!rkmpp_frames_ctx_is_drm(dst->hw_frames_ctx))
+            return AVERROR(ENOSYS);
+        err = rkmpp_map_to_drm(hwfc, dst, src, flags);
+    } else if (dst->format == AV_PIX_FMT_VULKAN) {
+        err = rkmpp_map_to_vulkan(hwfc, dst, src, flags);
+    } else if (hwfc->sw_format != dst->format) {
         return AVERROR(ENOSYS);
-
-    err = rkmpp_map_frame(hwfc, dst, src, flags);
+    } else {
+        err = rkmpp_map_frame(hwfc, dst, src, flags);
+    }
     if (err)
         return err;
 
@@ -634,6 +817,7 @@ const HWContextType ff_hwcontext_type_rkmpp = {
     .transfer_get_formats   = &rkmpp_transfer_get_formats,
     .transfer_data_to       = &rkmpp_transfer_data_to,
     .transfer_data_from     = &rkmpp_transfer_data_from,
+    .map_to                 = &rkmpp_map_to,
     .map_from               = &rkmpp_map_from,
 
     .pix_fmts = (const enum AVPixelFormat[]) {
