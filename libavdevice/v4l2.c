@@ -34,6 +34,7 @@
 
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
+#include "libavutil/file_open.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/mem.h"
 #include "libavutil/parseutils.h"
@@ -47,6 +48,28 @@
 #include "timefilter.h"
 #include "v4l2-common.h"
 #include <dirent.h>
+#include <math.h>
+#include <stdio.h>
+
+#if HAVE_LINUX_MEDIA_H
+#include <linux/media.h>
+#include <linux/v4l2-subdev.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#endif
+
+#if defined(VIDIOC_QUERY_DV_TIMINGS) && defined(V4L2_DV_BT_FRAME_WIDTH)
+#define USE_DV_TIMINGS 1
+#else
+#define USE_DV_TIMINGS 0
+#endif
+
+#if HAVE_LINUX_MEDIA_H && USE_DV_TIMINGS && \
+    defined(MEDIA_IOC_G_TOPOLOGY) && defined(VIDIOC_SUBDEV_QUERY_DV_TIMINGS)
+#define USE_MEDIA_GRAPH 1
+#else
+#define USE_MEDIA_GRAPH 0
+#endif
 
 #if CONFIG_LIBV4L2
 #include <libv4l2.h>
@@ -109,6 +132,7 @@ struct video_data {
     int list_standard;  /**< Set by a private option. */
     char *framerate;    /**< Set by a private option. */
     int requested_buffers; /**< Set by a private option. */
+    AVRational dv_rate;
 
     int use_libv4l2;
     int (*open_f)(const char *file, int oflag, ...);
@@ -358,6 +382,315 @@ static void list_standards(AVFormatContext *ctx)
                standard.index, (uint64_t)standard.id, standard.name);
     }
 }
+
+#if USE_DV_TIMINGS
+static AVRational dv_timings_rate(const struct v4l2_bt_timings *bt)
+{
+    uint64_t total = (uint64_t)V4L2_DV_BT_FRAME_WIDTH(bt) * V4L2_DV_BT_FRAME_HEIGHT(bt);
+    double fps, nominal, ntsc;
+
+    if (!total || !bt->pixelclock)
+        return (AVRational){ 0, 1 };
+
+    fps = (double)bt->pixelclock / total;
+#ifdef V4L2_DV_FL_CAN_REDUCE_FPS
+    if ((bt->flags & V4L2_DV_FL_CAN_REDUCE_FPS) && (bt->flags & V4L2_DV_FL_REDUCED_FPS))
+        fps = fps * 1000 / 1001;
+#endif
+
+    /* the pixel clock is measured, so snap to the nominal rate it is close to */
+    nominal = lrint(fps);
+    ntsc    = lrint(fps * 1.001) / 1.001;
+    if (fabs(fps - ntsc) < fabs(fps - nominal) && fabs(fps - ntsc) < fps * 0.005)
+        return (AVRational){ lrint(ntsc * 1.001) * 1000, 1001 };
+    if (nominal > 0 && fabs(fps - nominal) < fps * 0.005)
+        return (AVRational){ nominal, 1 };
+    return av_d2q(fps, 1001000);
+}
+
+static int dv_timings_error(AVFormatContext *ctx, const char *dev, int err)
+{
+    if (err == AVERROR(ENOTTY) || err == AVERROR(EINVAL) || err == AVERROR(ENODATA))
+        return AVERROR(ENOTTY);
+    av_log(ctx, AV_LOG_WARNING, "No usable signal on %s: %s\n", dev, av_err2str(err));
+    return err;
+}
+
+#if USE_MEDIA_GRAPH
+typedef struct MediaGraph {
+    struct media_v2_topology   topo;
+    struct media_v2_entity    *ents;
+    struct media_v2_interface *intfs;
+    struct media_v2_pad       *pads;
+    struct media_v2_link      *links;
+} MediaGraph;
+
+static void media_graph_free(MediaGraph *g)
+{
+    av_freep(&g->ents);
+    av_freep(&g->intfs);
+    av_freep(&g->pads);
+    av_freep(&g->links);
+}
+
+static int media_graph_get(int fd, MediaGraph *g)
+{
+    for (int tries = 0; tries < 4; tries++) {
+        uint64_t version;
+
+        memset(g, 0, sizeof(*g));
+        if (ioctl(fd, MEDIA_IOC_G_TOPOLOGY, &g->topo) < 0)
+            return AVERROR(errno);
+        version = g->topo.topology_version;
+
+        g->ents  = av_calloc(g->topo.num_entities   + 1, sizeof(*g->ents));
+        g->intfs = av_calloc(g->topo.num_interfaces + 1, sizeof(*g->intfs));
+        g->pads  = av_calloc(g->topo.num_pads       + 1, sizeof(*g->pads));
+        g->links = av_calloc(g->topo.num_links      + 1, sizeof(*g->links));
+        if (!g->ents || !g->intfs || !g->pads || !g->links) {
+            media_graph_free(g);
+            return AVERROR(ENOMEM);
+        }
+        g->topo.ptr_entities   = (uintptr_t)g->ents;
+        g->topo.ptr_interfaces = (uintptr_t)g->intfs;
+        g->topo.ptr_pads       = (uintptr_t)g->pads;
+        g->topo.ptr_links      = (uintptr_t)g->links;
+
+        if (!ioctl(fd, MEDIA_IOC_G_TOPOLOGY, &g->topo) &&
+            g->topo.topology_version == version)
+            return 0;
+        media_graph_free(g);
+        if (errno != ENOSPC && g->topo.topology_version == version)
+            return AVERROR(errno);
+    }
+    return AVERROR(EAGAIN);
+}
+
+static uint32_t media_pad_entity(const MediaGraph *g, uint32_t pad_id)
+{
+    for (unsigned i = 0; i < g->topo.num_pads; i++)
+        if (g->pads[i].id == pad_id)
+            return g->pads[i].entity_id;
+    return 0;
+}
+
+static const struct media_v2_interface *media_entity_intf(const MediaGraph *g,
+                                                          uint32_t entity_id)
+{
+    for (unsigned i = 0; i < g->topo.num_links; i++) {
+        const struct media_v2_link *l = &g->links[i];
+
+        if ((l->flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_INTERFACE_LINK ||
+            l->sink_id != entity_id)
+            continue;
+        for (unsigned j = 0; j < g->topo.num_interfaces; j++)
+            if (g->intfs[j].id == l->source_id)
+                return &g->intfs[j];
+    }
+    return NULL;
+}
+
+static int subdev_query_dv_timings(AVFormatContext *ctx, const MediaGraph *g,
+                                   uint32_t entity_id, struct v4l2_dv_timings *t)
+{
+    const struct media_v2_interface *intf = media_entity_intf(g, entity_id);
+    char path[64], line[256], devname[256] = "";
+    FILE *f;
+    int fd, ret = 0;
+
+    if (!intf || intf->intf_type != MEDIA_INTF_T_V4L_SUBDEV)
+        return AVERROR(ENOTTY);
+
+    snprintf(path, sizeof(path), "/sys/dev/char/%u:%u/uevent",
+             intf->devnode.major, intf->devnode.minor);
+    if (!(f = fopen(path, "r")))
+        return AVERROR(ENOTTY);
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "DEVNAME=%255s", devname) == 1)
+            break;
+    fclose(f);
+    if (!*devname)
+        return AVERROR(ENOTTY);
+
+    snprintf(line, sizeof(line), "/dev/%s", devname);
+    fd = avpriv_open(line, O_RDWR);
+    if (fd < 0)
+        return AVERROR(ENOTTY);
+    memset(t, 0, sizeof(*t));
+    if (ioctl(fd, VIDIOC_SUBDEV_QUERY_DV_TIMINGS, t) < 0)
+        ret = dv_timings_error(ctx, line, AVERROR(errno));
+    close(fd);
+
+    if (!ret)
+        av_log(ctx, AV_LOG_VERBOSE, "Using the DV timings of %s\n", line);
+    return ret;
+}
+
+/* Find the subdevice upstream of the capture node that reports DV timings. */
+static int media_graph_dv_timings(AVFormatContext *ctx, const MediaGraph *g,
+                                  dev_t rdev, struct v4l2_dv_timings *t)
+{
+    uint32_t queue[16];
+    int n = 0;
+
+    for (unsigned i = 0; i < g->topo.num_interfaces; i++) {
+        const struct media_v2_interface *intf = &g->intfs[i];
+
+        if (intf->intf_type != MEDIA_INTF_T_V4L_VIDEO ||
+            makedev(intf->devnode.major, intf->devnode.minor) != rdev)
+            continue;
+        for (unsigned j = 0; j < g->topo.num_links && !n; j++) {
+            const struct media_v2_link *l = &g->links[j];
+            if ((l->flags & MEDIA_LNK_FL_LINK_TYPE) == MEDIA_LNK_FL_INTERFACE_LINK &&
+                l->source_id == intf->id)
+                queue[n++] = l->sink_id;
+        }
+        break;
+    }
+    if (!n)
+        return AVERROR(ENODEV);
+
+    for (int head = 0; head < n; head++) {
+        for (unsigned i = 0; i < g->topo.num_pads; i++) {
+            const struct media_v2_pad *pad = &g->pads[i];
+
+            uint32_t need = 0;
+
+            if (pad->entity_id != queue[head] || !(pad->flags & MEDIA_PAD_FL_SINK))
+                continue;
+            /* follow the enabled links, or all of them if the pad has none */
+            for (unsigned j = 0; j < g->topo.num_links; j++)
+                if ((g->links[j].flags & MEDIA_LNK_FL_LINK_TYPE) == MEDIA_LNK_FL_DATA_LINK &&
+                    g->links[j].sink_id == pad->id)
+                    need |= g->links[j].flags & MEDIA_LNK_FL_ENABLED;
+
+            for (unsigned j = 0; j < g->topo.num_links; j++) {
+                const struct media_v2_link *l = &g->links[j];
+                uint32_t src;
+                int k, ret;
+
+                if ((l->flags & MEDIA_LNK_FL_LINK_TYPE) != MEDIA_LNK_FL_DATA_LINK ||
+                    (l->flags & MEDIA_LNK_FL_ENABLED) != need || l->sink_id != pad->id)
+                    continue;
+                src = media_pad_entity(g, l->source_id);
+                for (k = 0; k < n && queue[k] != src; k++)
+                    ;
+                if (!src || k < n || n == FF_ARRAY_ELEMS(queue))
+                    continue;
+                queue[n++] = src;
+
+                ret = subdev_query_dv_timings(ctx, g, src, t);
+                if (ret != AVERROR(ENOTTY))
+                    return ret;
+            }
+        }
+    }
+    return AVERROR(ENOTTY);
+}
+
+static int source_dv_timings(AVFormatContext *ctx, struct v4l2_dv_timings *t)
+{
+    struct video_data *s = ctx->priv_data;
+    struct stat st;
+    struct dirent *entry;
+    DIR *dir;
+    int ret = AVERROR(ENOTTY);
+
+    if (fstat(s->fd, &st) < 0 || !S_ISCHR(st.st_mode) || !(dir = opendir("/dev")))
+        return ret;
+
+    while ((entry = readdir(dir))) {
+        MediaGraph g;
+        char path[300];
+        int fd, err;
+
+        if (strncmp(entry->d_name, "media", 5))
+            continue;
+        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
+        if ((fd = avpriv_open(path, O_RDONLY)) < 0)
+            continue;
+        err = media_graph_get(fd, &g);
+        close(fd);
+        if (err < 0)
+            continue;
+        err = media_graph_dv_timings(ctx, &g, st.st_rdev, t);
+        media_graph_free(&g);
+        if (err != AVERROR(ENODEV)) {
+            ret = err;
+            break;
+        }
+    }
+    closedir(dir);
+    return ret;
+}
+#endif
+
+/* Query the DV timings of the capture node, or else of the subdevice feeding it. */
+static int query_dv_timings(AVFormatContext *ctx, struct v4l2_dv_timings *t)
+{
+    struct video_data *s = ctx->priv_data;
+    int ret = 0;
+
+    memset(t, 0, sizeof(*t));
+    if (v4l2_ioctl(s->fd, VIDIOC_QUERY_DV_TIMINGS, t) < 0) {
+        ret = dv_timings_error(ctx, ctx->url, AVERROR(errno));
+#if USE_MEDIA_GRAPH
+        if (ret == AVERROR(ENOTTY) && !s->use_libv4l2)
+            ret = source_dv_timings(ctx, t);
+#endif
+    }
+    if (ret < 0)
+        return ret;
+    if (t->type != V4L2_DV_BT_656_1120 || !t->bt.width || !t->bt.height)
+        return AVERROR(ENOTTY);
+
+    s->dv_rate = dv_timings_rate(&t->bt);
+    av_log(ctx, AV_LOG_INFO, "Detected %ux%u%s at %d/%d fps from the DV timings\n",
+           t->bt.width, t->bt.height, t->bt.interlaced ? "i" : "p",
+           s->dv_rate.num, s->dv_rate.den);
+    return 0;
+}
+#endif
+
+/* The current raw format of the device, or the first raw format it lists. */
+static uint32_t current_raw_format(AVFormatContext *ctx)
+{
+    struct video_data *s = ctx->priv_data;
+    struct v4l2_format fmt = { .type = s->buf_type };
+    struct v4l2_fmtdesc vfd = { .type = s->buf_type };
+
+    if (!v4l2_ioctl(s->fd, VIDIOC_G_FMT, &fmt) && fmt.fmt.pix.pixelformat &&
+        ff_fmt_v4l2ff(fmt.fmt.pix.pixelformat, AV_CODEC_ID_RAWVIDEO) != AV_PIX_FMT_NONE)
+        return fmt.fmt.pix.pixelformat;
+
+    for (; !v4l2_ioctl(s->fd, VIDIOC_ENUM_FMT, &vfd); vfd.index++)
+        if (!(vfd.flags & V4L2_FMT_FLAG_COMPRESSED) &&
+            ff_fmt_v4l2ff(vfd.pixelformat, AV_CODEC_ID_RAWVIDEO) != AV_PIX_FMT_NONE)
+            return vfd.pixelformat;
+    return 0;
+}
+
+#if HAVE_STRUCT_V4L2_FRMIVALENUM_DISCRETE
+static void largest_frame_size(AVFormatContext *ctx, uint32_t pixelformat,
+                               int *width, int *height)
+{
+    struct video_data *s = ctx->priv_data;
+    struct v4l2_frmsizeenum vfse = { .pixel_format = pixelformat };
+
+    for (; !v4l2_ioctl(s->fd, VIDIOC_ENUM_FRAMESIZES, &vfse); vfse.index++) {
+        if (vfse.type != V4L2_FRMSIZE_TYPE_DISCRETE) {
+            *width  = vfse.stepwise.max_width;
+            *height = vfse.stepwise.max_height;
+            return;
+        }
+        if ((uint64_t)vfse.discrete.width * vfse.discrete.height >
+            (uint64_t)*width * *height) {
+            *width  = vfse.discrete.width;
+            *height = vfse.discrete.height;
+        }
+    }
+}
+#endif
 
 static void mmap_free(struct video_data *s, int n)
 {
@@ -809,7 +1142,10 @@ static int v4l2_set_parameters(AVFormatContext *ctx)
                    "The driver does not permit changing the time per frame\n");
         }
     }
-    if (tpf->denominator > 0 && tpf->numerator > 0) {
+    if (s->dv_rate.num && !(framerate_q.num && framerate_q.den)) {
+        ctx->streams[0]->avg_frame_rate = s->dv_rate;
+        ctx->streams[0]->r_frame_rate   = s->dv_rate;
+    } else if (tpf->denominator > 0 && tpf->numerator > 0) {
         ctx->streams[0]->avg_frame_rate.num = tpf->denominator;
         ctx->streams[0]->avg_frame_rate.den = tpf->numerator;
         ctx->streams[0]->r_frame_rate = ctx->streams[0]->avg_frame_rate;
@@ -888,6 +1224,10 @@ static int v4l2_read_header(AVFormatContext *ctx)
     enum AVCodecID codec_id = AV_CODEC_ID_NONE;
     enum AVPixelFormat pix_fmt = AV_PIX_FMT_NONE;
     struct v4l2_input input = { 0 };
+    int have_dv = 0, probe_size = 0;
+#if USE_DV_TIMINGS
+    struct v4l2_dv_timings dv;
+#endif
 
     st = avformat_new_stream(ctx, NULL);
     if (!st)
@@ -968,6 +1308,15 @@ static int v4l2_read_header(AVFormatContext *ctx)
         }
     }
 
+#if USE_DV_TIMINGS
+    if ((!s->width && !s->height) || !s->framerate)
+        have_dv = query_dv_timings(ctx, &dv) >= 0;
+    if (!s->width && !s->height && have_dv) {
+        s->width  = dv.bt.width;
+        s->height = dv.bt.height;
+    }
+#endif
+
     if (!s->width && !s->height) {
         struct v4l2_format fmt = { .type = s->buf_type };
 
@@ -982,9 +1331,34 @@ static int v4l2_read_header(AVFormatContext *ctx)
 
         s->width  = fmt.fmt.pix.width;
         s->height = fmt.fmt.pix.height;
+        probe_size = !s->width || !s->height;
         av_log(ctx, AV_LOG_VERBOSE,
                "Setting frame size to %dx%d\n", s->width, s->height);
     }
+
+    /* Devices such as HDMI receivers may report no current format at all. */
+    if ((have_dv || probe_size) &&
+        pix_fmt == AV_PIX_FMT_NONE && ctx->video_codec_id == AV_CODEC_ID_NONE) {
+        uint32_t cur = current_raw_format(ctx);
+
+        if (cur) {
+            pix_fmt = ff_fmt_v4l2ff(cur, AV_CODEC_ID_RAWVIDEO);
+            av_log(ctx, AV_LOG_VERBOSE, "Using the device format %s\n",
+                   av_get_pix_fmt_name(pix_fmt));
+        }
+    }
+
+#if HAVE_STRUCT_V4L2_FRMIVALENUM_DISCRETE
+    if (probe_size) {
+        uint32_t f = ff_fmt_ff2v4l(pix_fmt, ctx->video_codec_id);
+
+        s->width = s->height = 0;
+        if (f)
+            largest_frame_size(ctx, f, &s->width, &s->height);
+        av_log(ctx, AV_LOG_VERBOSE, "The device reports no frame size, "
+               "using the largest it lists: %dx%d\n", s->width, s->height);
+    }
+#endif
 
     res = device_try_init(ctx, pix_fmt, &s->width, &s->height, &desired_format, &codec_id);
     if (res < 0)

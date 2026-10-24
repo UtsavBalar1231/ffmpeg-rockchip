@@ -1390,6 +1390,15 @@ previously selected channel.
 Set the video frame size. The argument must be a string in the form
 @var{WIDTH}x@var{HEIGHT} or a valid size abbreviation.
 
+When no size is set, it is taken from the DV timings of the incoming signal
+if the device, or a subdevice feeding it in the media controller graph,
+reports them, as HDMI receivers do. The frame rate then also comes from the
+timings unless @option{framerate} is set, and when no @option{input_format}
+is set either, the current raw format of the device, or else the first raw
+format it lists, is used. Without DV timings the current frame size of the
+device is used; when the device reports none, the largest size it lists for
+the format is used.
+
 @item pixel_format
 Select the pixel format (only valid for raw video input).
 
