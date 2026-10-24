@@ -796,7 +796,12 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
         break;
     case AV_CODEC_ID_MJPEG:
         {
-            qp_init = r->qp_init >= 1 ? r->qp_init : 80;
+            int quality = r->qp_init;
+
+            if (quality < 1 && avctx->global_quality > 0)
+                quality = (avctx->flags & AV_CODEC_FLAG_QSCALE)
+                          ? avctx->global_quality / FF_QP2LAMBDA : avctx->global_quality;
+            qp_init = quality >= 1 ? av_clip(quality, 1, 99) : 80;
             qp_max = r->qp_max >= 1 ? r->qp_max : 99;
             qp_min = r->qp_min >= 1 ? r->qp_min : 1;
             qp_max_i = qp_min_i = 0;
