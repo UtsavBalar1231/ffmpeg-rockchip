@@ -636,8 +636,12 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
         {
             switch (rc_mode) {
             case MPP_ENC_RC_MODE_FIXQP:
+                /* the frame QP stays qp_init; the bounds only clamp ROI QPs */
                 qp_init = r->qp_init >= 0 ? r->qp_init : 26;
-                qp_max = qp_min = qp_max_i = qp_min_i = qp_init;
+                qp_max   = r->qp_max   >= 0 ? FFMAX(r->qp_max,   qp_init) : qp_init;
+                qp_min   = r->qp_min   >= 0 ? FFMIN(r->qp_min,   qp_init) : qp_init;
+                qp_max_i = r->qp_max_i >= 0 ? FFMAX(r->qp_max_i, qp_init) : qp_max;
+                qp_min_i = r->qp_min_i >= 0 ? FFMIN(r->qp_min_i, qp_init) : qp_min;
                 mpp_enc_cfg_set_s32(cfg, "rc:qp_ip", 0);
                 break;
             case MPP_ENC_RC_MODE_CBR:
