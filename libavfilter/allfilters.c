@@ -532,6 +532,7 @@ extern const FFFilter ff_vf_v360;
 extern const FFFilter ff_vf_v360_vulkan;
 extern const FFFilter ff_vf_vaguedenoiser;
 extern const FFFilter ff_vf_varblur;
+extern const FFFilter ff_vf_vdpp_rkmpp;
 extern const FFFilter ff_vf_vectorscope;
 extern const FFFilter ff_vf_vflip;
 extern const FFFilter ff_vf_vflip_vulkan;

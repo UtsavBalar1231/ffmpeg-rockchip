@@ -567,6 +567,7 @@ OBJS-$(CONFIG_V360_FILTER)                   += vf_v360.o
 OBJS-$(CONFIG_V360_VULKAN_FILTER)            += vf_v360_vulkan.o
 OBJS-$(CONFIG_VAGUEDENOISER_FILTER)          += vf_vaguedenoiser.o
 OBJS-$(CONFIG_VARBLUR_FILTER)                += vf_varblur.o framesync.o
+OBJS-$(CONFIG_VDPP_RKMPP_FILTER)             += vf_vdpp_rkmpp.o scale_eval.o
 OBJS-$(CONFIG_VECTORSCOPE_FILTER)            += vf_vectorscope.o
 OBJS-$(CONFIG_VFLIP_FILTER)                  += vf_vflip.o
 OBJS-$(CONFIG_VFLIP_VULKAN_FILTER)           += vf_flip_vulkan.o vulkan.o
