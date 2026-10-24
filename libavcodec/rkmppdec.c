@@ -862,10 +862,8 @@ static int rkmpp_export_frame(AVCodecContext *avctx, AVFrame *frame, MppFrame mp
                                               (AVRational) { frame->width, frame->height });
     }
 
-    if ((avctx->codec_id == AV_CODEC_ID_HEVC ||
-         avctx->codec_id == AV_CODEC_ID_AV1) &&
-        (frame->color_trc == AVCOL_TRC_SMPTE2084 ||
-         frame->color_trc == AVCOL_TRC_ARIB_STD_B67)) {
+    if (avctx->codec_id == AV_CODEC_ID_HEVC ||
+        avctx->codec_id == AV_CODEC_ID_AV1) {
         ret = rkmpp_export_mastering_display(avctx, frame, mpp_frame_get_mastering_display(mpp_frame));
         if (ret < 0)
             return ret;
