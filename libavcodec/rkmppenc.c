@@ -52,6 +52,11 @@ static const char *const hevc_no_refresh_socs[] = {
     "rk3576", NULL,
 };
 
+/* SoCs whose HEVC encoder (VEPU510) fails frames with temporal layers */
+static const char *const hevc_no_tsvc_socs[] = {
+    "rk3576", NULL,
+};
+
 /* SoCs whose H.264 encoder (VEPU510) never gets MPP's intra refresh band */
 static const char *const h264_roi_refresh_socs[] = {
     "rk3576", NULL,
@@ -1775,6 +1780,13 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
     if (avctx->codec_id == AV_CODEC_ID_HEVC && r->intra_refresh &&
         rkmpp_soc_is_any(hevc_no_refresh_socs)) {
         av_log(avctx, AV_LOG_ERROR, "Intra refresh is not supported by this SoC's HEVC encoder\n");
+        return AVERROR(ENOSYS);
+    }
+
+    /* the encoder reports errors on random frames and MPP drops them and restarts with an IDR */
+    if (avctx->codec_id == AV_CODEC_ID_HEVC && r->temporal_layers > 1 &&
+        rkmpp_soc_is_any(hevc_no_tsvc_socs)) {
+        av_log(avctx, AV_LOG_ERROR, "Temporal layers are not supported by this SoC's HEVC encoder\n");
         return AVERROR(ENOSYS);
     }
 
