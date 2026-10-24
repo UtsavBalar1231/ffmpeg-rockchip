@@ -29073,6 +29073,70 @@ drawbox=x=-t:y=0.5*(ih-iw/2.4)-t:w=iw+t*2:h=iw/2.4+t*2:t=2:c=red
 
 @c man end VAAPI VIDEO FILTERS
 
+@chapter RKRGA Video Filters
+@c man begin RKRGA VIDEO FILTERS
+
+The RKRGA filters run on the RGA 2D engine of Rockchip SoCs. They take and
+return DRM PRIME frames of an RKMPP hardware frames context, from the
+@code{*_rkmpp} decoders or from @code{hwupload} with an @code{rkmpp} device.
+
+To enable compilation of these filters you need to configure FFmpeg with
+@code{--enable-rkmpp --enable-rkrga}.
+
+The filters that draw on a frame first copy the input into a new frame of
+their own frames context, and draw on the copy.
+
+The filters below accept these options:
+
+@table @option
+@item core
+Pin the jobs to one RGA2 core, @code{rga2_core0} or @code{rga2_core1}.
+By default the driver picks a core.
+
+@item async_depth
+Number of frames in flight. Default is 2.
+@end table
+
+@section drawbox_rkrga
+
+Draw a colored box on the input video, like @code{drawbox}, with RGA color
+fills.
+
+It accepts the @code{x}, @code{y}, @code{width}, @code{w}, @code{height},
+@code{h}, @code{color}, @code{c}, @code{thickness}, @code{t} and
+@code{replace} options of @code{drawbox}, with the same expressions and
+constants, and they can be changed at runtime with a command. It differs
+from @code{drawbox} in these ways:
+
+@itemize
+@item
+A fill replaces the pixels, so a translucent color needs @code{replace=1}
+and a pixel format with alpha. An opaque color also sets alpha to opaque.
+
+@item
+The color @code{invert} and the @code{box_source} option are not supported.
+
+@item
+RGA draws rectangles of at least 2x2 pixels, so a 1 pixel edge is drawn
+2 pixels wide. On YUV formats the edges are widened to even coordinates,
+which covers the chroma samples @code{drawbox} writes; boxes with even
+coordinates and thickness match @code{drawbox} exactly.
+@end itemize
+
+YUV colors are converted with BT.601 limited range coefficients, as
+@code{drawbox} does.
+
+@subsection Examples
+@itemize
+@item
+Draw a red box on decoded frames:
+@example
+ffmpeg -hwaccel rkmpp -hwaccel_output_format drm_prime -i INPUT -vf drawbox_rkrga=x=100:y=100:w=320:h=240:c=red:t=4 -c:v h264_rkmpp OUTPUT
+@end example
+@end itemize
+
+@c man end RKRGA VIDEO FILTERS
+
 @chapter VideoToolbox Video Filters
 @c man begin VIDEOTOOLBOX VIDEO FILTERS
 

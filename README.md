@@ -7,7 +7,7 @@ for RK3576.
   H.263, MPEG-1/2/4 and VP8 decoders are kept for older SoCs.
 - `h264_rkmpp`, `hevc_rkmpp` and `mjpeg_rkmpp` encoders.
 - An RKMPP hardware-frames context over DRM PRIME, and the `scale_rkrga`,
-  `vpp_rkrga` and `overlay_rkrga` filters.
+  `vpp_rkrga`, `overlay_rkrga` and `drawbox_rkrga` filters.
 
 Base: FFmpeg `release/9.0`. The Rockchip code is nyanmisaka's ffmpeg-rockchip
 series, imported with her authorship, with fixes on top. Tested on RK3576

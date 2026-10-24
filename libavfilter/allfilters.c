@@ -270,6 +270,7 @@ extern const FFFilter ff_vf_dnn_detect;
 extern const FFFilter ff_vf_dnn_processing;
 extern const FFFilter ff_vf_doubleweave;
 extern const FFFilter ff_vf_drawbox;
+extern const FFFilter ff_vf_drawbox_rkrga;
 extern const FFFilter ff_vf_drawgraph;
 extern const FFFilter ff_vf_drawgrid;
 extern const FFFilter ff_vf_drawtext;
