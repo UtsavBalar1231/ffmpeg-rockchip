@@ -55,6 +55,7 @@ typedef struct MPPEncFrame {
     MppEncUserDataSet   mpp_sei_set;
     MppEncROICfg        roi_cfg;
     MppEncROIRegion     roi_regions[ENC_MAX_ROI_REGIONS];
+    int                 recovery;
     struct MPPEncFrame *next;
     int                 queued;
     int                 in_mpp;

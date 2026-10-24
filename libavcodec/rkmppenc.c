@@ -26,7 +26,13 @@
 
 #include "config_components.h"
 #include "rkmppenc.h"
+#include "h264.h"
+#include "put_bits.h"
+#include "put_golomb.h"
+#include "sei.h"
 #include "startcode.h"
+
+#include "libavutil/intreadwrite.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -341,7 +347,7 @@ static void release_frame(MPPEncFrame *frame)
 }
 
 /* MPP hands each input frame back in the meta of the packet made from it. */
-static int release_input_frame(MPPEncFrame *list, MppPacket mpp_pkt)
+static int release_input_frame(MPPEncFrame *list, MppPacket mpp_pkt, int *recovery)
 {
     MppFrame mpp_frame = NULL;
 
@@ -353,6 +359,8 @@ static int release_input_frame(MPPEncFrame *list, MppPacket mpp_pkt)
 
     for (; list; list = list->next) {
         if (list->in_mpp && list->mpp_frame == mpp_frame) {
+            if (recovery)
+                *recovery = list->recovery;
             release_frame(list);
             return 0;
         }
@@ -1117,7 +1125,11 @@ static int rkmpp_get_refresh_band(AVCodecContext *avctx, const AVFrame *frame,
     idx = r->frame_idx++;
     k   = idx % gop;
 
-    if (!r->refresh_by_roi || idx < gop || k >= r->refresh_len)
+    mpp_enc_frame->recovery = 0;
+    if (idx < gop || k >= r->refresh_len)
+        return 0;
+    mpp_enc_frame->recovery = !k;
+    if (!r->refresh_by_roi)
         return 0;
 
     start = FFMAX(k * unit - (k ? 32 : 0), 0);
@@ -1404,6 +1416,55 @@ exit:
     return ret;
 }
 
+/* an H.264 recovery point SEI NAL unit; a count of a few hundred needs no emulation prevention */
+static int rkmpp_h264_recovery_sei(uint8_t *buf, int buf_size, int recovery_frame_cnt)
+{
+    uint8_t payload[8];
+    PutBitContext pb;
+    int len;
+
+    init_put_bits(&pb, payload, sizeof(payload));
+    set_ue_golomb(&pb, recovery_frame_cnt);
+    put_bits(&pb, 1, 0); /* exact_match_flag */
+    put_bits(&pb, 1, 0); /* broken_link_flag */
+    put_bits(&pb, 2, 0); /* changing_slice_group_idc */
+    if (put_bits_count(&pb) & 7) {
+        put_bits(&pb, 1, 1);
+        align_put_bits(&pb);
+    }
+    flush_put_bits(&pb);
+    len = put_bytes_output(&pb);
+
+    if (buf_size < 8 + len)
+        return AVERROR(EINVAL);
+    AV_WB32(buf, 1);
+    buf[4] = H264_NAL_SEI;
+    buf[5] = SEI_TYPE_RECOVERY_POINT;
+    buf[6] = len;
+    memcpy(buf + 7, payload, len);
+    buf[7 + len] = 0x80;
+
+    return 8 + len;
+}
+
+/* offset of the start code of the first SEI, prefix or slice NAL unit */
+static int rkmpp_h264_sei_offset(const uint8_t *buf, int size)
+{
+    for (int i = 0; i + 3 < size; i++) {
+        int type;
+
+        if (buf[i] || buf[i + 1] || buf[i + 2] != 1)
+            continue;
+        type = buf[i + 3] & 0x1f;
+        if (type == H264_NAL_SEI || type == H264_NAL_PREFIX ||
+            type == H264_NAL_SLICE || type == H264_NAL_IDR_SLICE)
+            return i && !buf[i - 1] ? i - 1 : i;
+        i += 2;
+    }
+
+    return 0;
+}
+
 /*
  * MPP's HEVC HALs patch nuh_temporal_id_plus1 from the syntax of the frame
  * prepared last, which with two frames in flight is the next one. The
@@ -1431,6 +1492,7 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     int key_frame = 0;
     int avg_qp = -1;
     int tid = -1;
+    int recovery = 0;
     int ret;
 
     if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
@@ -1447,7 +1509,7 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     if (!mpp_pkt)
         return AVERROR(ENOMEM);
 
-    ret = release_input_frame(r->frame_list, mpp_pkt);
+    ret = release_input_frame(r->frame_list, mpp_pkt, &recovery);
 
     if (mpp_packet_get_eos(mpp_pkt)) {
         av_log(avctx, AV_LOG_DEBUG, "Received an EOS packet\n");
@@ -1472,12 +1534,29 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     /* freeing MppPacket data in buffer callbacks is not supported in async mode */
     {
         size_t mpp_pkt_length = mpp_packet_get_length(mpp_pkt);
+        const uint8_t *data = mpp_packet_get_data(mpp_pkt);
+        uint8_t sei[16];
+        int sei_len = 0, sei_pos = 0;
 
-        if ((ret = ff_get_encode_buffer(avctx, packet, mpp_pkt_length, 0)) < 0) {
+        /* the frame that starts a refresh cycle, as x264 marks it */
+        if (recovery) {
+            sei_len = rkmpp_h264_recovery_sei(sei, sizeof(sei), r->refresh_len - 1);
+            if (sei_len < 0) {
+                ret = sei_len;
+                goto exit;
+            }
+            sei_pos = rkmpp_h264_sei_offset(data, mpp_pkt_length);
+        }
+
+        if ((ret = ff_get_encode_buffer(avctx, packet, mpp_pkt_length + sei_len, 0)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "ff_get_encode_buffer failed: %d\n", ret);
             goto exit;
         }
-        memcpy(packet->data, mpp_packet_get_data(mpp_pkt), mpp_pkt_length);
+        memcpy(packet->data, data, sei_pos);
+        memcpy(packet->data + sei_pos, sei, sei_len);
+        memcpy(packet->data + sei_pos + sei_len, data + sei_pos, mpp_pkt_length - sei_pos);
+        if (recovery)
+            packet->flags |= AV_PKT_FLAG_KEY;
     }
 
     packet->time_base.num = avctx->time_base.num;
@@ -1504,8 +1583,7 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     mpp_meta_get_s32(mpp_meta, KEY_ENC_AVERAGE_QP, &avg_qp);
     if (avg_qp >= 0)
         ff_encode_add_stats_side_data(packet, avg_qp * FF_QP2LAMBDA, NULL, 0,
-                                      (packet->flags & AV_PKT_FLAG_KEY) ?
-                                      AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P);
+                                      key_frame ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P);
 
     mpp_packet_deinit(&mpp_pkt);
     return 0;
@@ -1595,7 +1673,7 @@ static void rkmpp_release_output(RKMPPEncContext *r)
         return;
 
     while (r->mapi->encode_get_packet(r->mctx, &mpp_pkt) == MPP_OK && mpp_pkt) {
-        release_input_frame(r->frame_list, mpp_pkt);
+        release_input_frame(r->frame_list, mpp_pkt, NULL);
         mpp_packet_deinit(&mpp_pkt);
     }
 }
