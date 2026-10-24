@@ -128,6 +128,16 @@ static int rkmpp_device_create(AVHWDeviceContext *hwdev, const char *device,
     return 0;
 }
 
+static int rkmpp_device_derive(AVHWDeviceContext *hwdev,
+                               AVHWDeviceContext *src_ctx,
+                               AVDictionary *opts, int flags)
+{
+    if (src_ctx->type != AV_HWDEVICE_TYPE_DRM)
+        return AVERROR(ENOSYS);
+
+    return rkmpp_device_create(hwdev, NULL, opts, flags);
+}
+
 static int rkmpp_frames_get_constraints(AVHWDeviceContext *hwdev,
                                         const void *hwconfig,
                                         AVHWFramesConstraints *constraints)
@@ -614,6 +624,7 @@ const HWContextType ff_hwcontext_type_rkmpp = {
     .frames_hwctx_size      = sizeof(AVRKMPPFramesContext),
 
     .device_create          = &rkmpp_device_create,
+    .device_derive          = &rkmpp_device_derive,
 
     .frames_get_constraints = &rkmpp_frames_get_constraints,
 
