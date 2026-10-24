@@ -45,6 +45,11 @@ static const char *const hevc_no_refresh_socs[] = {
     "rk3576", NULL,
 };
 
+/* SoCs whose H.264/HEVC encoder (VEPU580) ignores MPP's MppEncROICfg */
+static const char *const no_roi_cfg_socs[] = {
+    "rk3588", NULL,
+};
+
 static int rkmpp_soc_is_any(const char *const *socs)
 {
     char compat[512];
@@ -829,6 +834,90 @@ static int rkmpp_prepare_udu_sei_data(AVCodecContext *avctx, MPPEncFrame *mpp_en
     return 0;
 }
 
+/*
+ * The H.264/HEVC HALs keep the ROI pointer of the last frame that carried one,
+ * so once ROI is used every later frame gets its own config, empty or not.
+ */
+static int rkmpp_prepare_roi(AVCodecContext *avctx, MPPEncFrame *mpp_enc_frame,
+                             const AVFrame *frame)
+{
+    RKMPPEncContext *r = avctx->priv_data;
+    const AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_REGIONS_OF_INTEREST);
+    MppEncROICfg *roi_cfg = &mpp_enc_frame->roi_cfg;
+    MppMeta mpp_meta;
+
+    if (sd && !r->roi_supported) {
+        if (!r->roi_warned)
+            av_log(avctx, AV_LOG_WARNING, "ROI is not supported by this SoC's encoder, ignoring it\n");
+        r->roi_warned = 1;
+        return 0;
+    }
+    if (!sd && !r->roi_active)
+        return 0;
+
+    roi_cfg->number  = 0;
+    roi_cfg->regions = mpp_enc_frame->roi_regions;
+
+    if (sd) {
+        const AVRegionOfInterest *roi = (const AVRegionOfInterest *)sd->data;
+        uint32_t roi_size = roi->self_size;
+        int nb_roi;
+
+        if (!roi_size || sd->size % roi_size) {
+            av_log(avctx, AV_LOG_ERROR, "Invalid ROI side data\n");
+            return AVERROR(EINVAL);
+        }
+        nb_roi = sd->size / roi_size;
+        if (nb_roi > ENC_MAX_ROI_REGIONS && !r->roi_warned) {
+            av_log(avctx, AV_LOG_WARNING, "More ROIs set than supported (%d > %d)\n",
+                   nb_roi, ENC_MAX_ROI_REGIONS);
+            r->roi_warned = 1;
+        }
+
+        for (int i = 0; i < nb_roi && roi_cfg->number < ENC_MAX_ROI_REGIONS; i++) {
+            MppEncROIRegion *region = &mpp_enc_frame->roi_regions[roi_cfg->number];
+            int left, top, right, bottom, qp_delta;
+
+            roi = (const AVRegionOfInterest *)(sd->data + roi_size * i);
+            if (!roi->qoffset.den) {
+                av_log(avctx, AV_LOG_ERROR, "Invalid ROI quantisation offset\n");
+                return AVERROR(EINVAL);
+            }
+
+            /* MPP takes 16x16 blocks and rejects regions past the frame */
+            left   = ALIGN_DOWN(av_clip(roi->left, 0, avctx->width), 16);
+            top    = ALIGN_DOWN(av_clip(roi->top,  0, avctx->height), 16);
+            right  = FFMIN(FFALIGN(av_clip(roi->right,  0, avctx->width),  16), avctx->width);
+            bottom = FFMIN(FFALIGN(av_clip(roi->bottom, 0, avctx->height), 16), avctx->height);
+            if (right <= left || bottom <= top)
+                continue;
+
+            qp_delta = lrint(av_clipd(av_q2d(roi->qoffset), -1.0, 1.0) * 51);
+
+            *region = (MppEncROIRegion) {
+                .x       = left,
+                .y       = top,
+                .w       = right - left,
+                .h       = bottom - top,
+                .quality = qp_delta,
+            };
+            roi_cfg->number++;
+            av_log(avctx, AV_LOG_DEBUG, "ROI: (%d,%d)-(%d,%d) -> %+d\n",
+                   left, top, right, bottom, qp_delta);
+        }
+        r->roi_active = 1;
+    }
+
+    mpp_meta = mpp_frame_get_meta(mpp_enc_frame->mpp_frame);
+    if (!mpp_meta ||
+        mpp_meta_set_ptr(mpp_meta, KEY_ROI_DATA, roi_cfg) != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set the ROI config\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    return 0;
+}
+
 static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
                               MPPEncFrame **out)
 {
@@ -1038,6 +1127,13 @@ static int rkmpp_submit_frame(AVCodecContext *avctx, AVFrame *frame,
         (avctx->codec_id == AV_CODEC_ID_H264 ||
          avctx->codec_id == AV_CODEC_ID_HEVC)) {
         ret = rkmpp_prepare_udu_sei_data(avctx, mpp_enc_frame);
+        if (ret < 0)
+            goto exit;
+    }
+
+    if (avctx->codec_id == AV_CODEC_ID_H264 ||
+        avctx->codec_id == AV_CODEC_ID_HEVC) {
+        ret = rkmpp_prepare_roi(avctx, mpp_enc_frame, frame);
         if (ret < 0)
             goto exit;
     }
@@ -1365,6 +1461,7 @@ static av_cold int rkmpp_encode_init(AVCodecContext *avctx)
     r->afbc_input = (avctx->codec_id == AV_CODEC_ID_H264 ||
                      avctx->codec_id == AV_CODEC_ID_HEVC) &&
                     rkmpp_soc_is_any(afbc_input_socs);
+    r->roi_supported = !rkmpp_soc_is_any(no_roi_cfg_socs);
 
     if ((ret = mpp_check_support_format(MPP_CTX_ENC, coding_type)) != MPP_OK) {
         av_log(avctx, AV_LOG_ERROR, "MPP doesn't support encoding codec '%s' (%d)\n",

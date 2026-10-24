@@ -46,12 +46,15 @@
 #define H26X_ASYNC_FRAMES  4
 #define MJPEG_ASYNC_FRAMES 8
 #define ENC_WAIT_TIMEOUT_MS 2000
+#define ENC_MAX_ROI_REGIONS 8
 #define ALIGN_DOWN(a, b) ((a) & ~((b)-1))
 
 typedef struct MPPEncFrame {
     AVFrame            *frame;
     MppFrame            mpp_frame;
     MppEncUserDataSet   mpp_sei_set;
+    MppEncROICfg        roi_cfg;
+    MppEncROIRegion     roi_regions[ENC_MAX_ROI_REGIONS];
     struct MPPEncFrame *next;
     int                 queued;
     int                 in_mpp;
@@ -74,6 +77,9 @@ typedef struct RKMPPEncContext {
     MppFrameFormat     mpp_fmt;
     enum AVPixelFormat pix_fmt;
     int                afbc_input;
+    int                roi_supported;
+    int                roi_active;
+    int                roi_warned;
 
     MPPEncFrame       *frame_list;
     int                async_frames;
