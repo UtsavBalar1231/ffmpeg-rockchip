@@ -26,6 +26,7 @@
 
 #include "config_components.h"
 #include "rkmppenc.h"
+#include "startcode.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -1351,6 +1352,25 @@ exit:
     return ret;
 }
 
+/*
+ * MPP's HEVC HALs patch nuh_temporal_id_plus1 from the syntax of the frame
+ * prepared last, which with two frames in flight is the next one. The
+ * packet meta carries the frame's own temporal id.
+ */
+static void rkmpp_fix_hevc_temporal_id(uint8_t *buf, int size, int tid)
+{
+    const uint8_t *p = buf, *end = buf + size;
+    uint32_t state = UINT32_MAX;
+
+    while (p < end) {
+        p = avpriv_find_start_code(p, end, &state);
+        if ((state & 0xffffff00) != 0x100 || p >= end)
+            break;
+        if (((state >> 1) & 0x3f) < 32)
+            buf[p - buf] = (p[0] & 0xf8) | (tid + 1);
+    }
+}
+
 static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout)
 {
     RKMPPEncContext *r = avctx->priv_data;
@@ -1358,6 +1378,7 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
     MppMeta mpp_meta = NULL;
     int key_frame = 0;
     int avg_qp = -1;
+    int tid = -1;
     int ret;
 
     if ((ret = r->mapi->control(r->mctx, MPP_SET_OUTPUT_TIMEOUT, (MppParam)&timeout)) != MPP_OK) {
@@ -1418,6 +1439,11 @@ static int rkmpp_get_packet(AVCodecContext *avctx, AVPacket *packet, int timeout
         ret = AVERROR_EXTERNAL;
         goto exit;
     }
+
+    if (avctx->codec_id == AV_CODEC_ID_HEVC &&
+        mpp_meta_get_s32(mpp_meta, KEY_TEMPORAL_ID, &tid) == MPP_OK &&
+        tid >= 0 && tid < 7)
+        rkmpp_fix_hevc_temporal_id(packet->data, packet->size, tid);
 
     mpp_meta_get_s32(mpp_meta, KEY_OUTPUT_INTRA, &key_frame);
     if (key_frame)
