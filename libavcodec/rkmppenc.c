@@ -543,6 +543,82 @@ static int rkmpp_set_split_cfg(AVCodecContext *avctx, MppEncCfg cfg)
     return 0;
 }
 
+/*
+ * Dyadic temporal layers: frame i of a period of 2^(layers - 1) frames has
+ * tid layers - 1 - ctz(i) and refers to the latest frame of the layer of
+ * frame i - (i & -i). Entry 0 is the IDR; MPP loops over the others.
+ * MPP runs out of reconstruction buffers with 4 short-term layers, so 4
+ * layers keep layer 0 as long-term references as MPP's tsvc4 preset does:
+ * each layer 0 frame is one, and layer 1 refers to it.
+ */
+static int rkmpp_set_ref_cfg(AVCodecContext *avctx)
+{
+    RKMPPEncContext *r = avctx->priv_data;
+    const int layers = r->temporal_layers;
+    const int period = 1 << (layers - 1);
+    MppEncRefStFrmCfg st_cfg[(1 << 3) + 1] = { 0 };
+    MppEncRefLtFrmCfg lt_cfg = { 0 };
+    MppEncRefCfg ref = NULL;
+    int ret;
+
+    if (layers <= 1 && !r->ltr_interval)
+        return 0;
+
+    if (layers == 4 && r->ltr_interval && r->ltr_interval != period) {
+        av_log(avctx, AV_LOG_ERROR, "4 temporal layers use a long-term reference every %d frames, "
+               "ltr_interval must be 0 or %d\n", period, period);
+        return AVERROR(EINVAL);
+    }
+    if (r->ltr_interval % period) {
+        av_log(avctx, AV_LOG_ERROR, "ltr_interval must be a multiple of %d with %d temporal layers\n",
+               period, layers);
+        return AVERROR(EINVAL);
+    }
+
+    for (int i = 1; i <= period; i++) {
+        int tid = i == period ? 0 : layers - 1 - ff_ctz(i);
+        int j = i - (i & -i);
+
+        st_cfg[i].temporal_id = tid;
+        st_cfg[i].is_non_ref  = layers > 1 && tid == layers - 1;
+        st_cfg[i].ref_mode    = REF_TO_TEMPORAL_LAYER;
+        st_cfg[i].ref_arg     = j ? layers - 1 - ff_ctz(j) : 0;
+        if (layers == 4 && tid == 1)
+            st_cfg[i].ref_mode = REF_TO_PREV_LT_REF;
+    }
+    st_cfg[0].ref_mode = REF_TO_TEMPORAL_LAYER;
+
+    lt_cfg.lt_idx   = 0;
+    lt_cfg.ref_mode = REF_TO_PREV_LT_REF;
+    lt_cfg.lt_gap   = layers == 4 ? period : r->ltr_interval;
+
+    if (mpp_enc_ref_cfg_init(&ref) != MPP_OK || !ref) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to init the reference config\n");
+        return AVERROR_EXTERNAL;
+    }
+
+    ret = mpp_enc_ref_cfg_set_cfg_cnt(ref, !!lt_cfg.lt_gap, period + 1);
+    if (ret == MPP_OK && lt_cfg.lt_gap)
+        ret = mpp_enc_ref_cfg_add_lt_cfg(ref, 1, &lt_cfg);
+    if (ret == MPP_OK)
+        ret = mpp_enc_ref_cfg_add_st_cfg(ref, period + 1, st_cfg);
+    if (ret == MPP_OK)
+        ret = mpp_enc_ref_cfg_check(ref);
+    if (ret == MPP_OK)
+        ret = r->mapi->control(r->mctx, MPP_ENC_SET_REF_CFG, ref);
+    mpp_enc_ref_cfg_deinit(&ref);
+
+    if (ret != MPP_OK) {
+        av_log(avctx, AV_LOG_ERROR, "Failed to set the reference config: %d\n", ret);
+        return AVERROR_EXTERNAL;
+    }
+
+    av_log(avctx, AV_LOG_VERBOSE, "Temporal layers: %d, long-term reference interval: %d\n",
+           layers, lt_cfg.lt_gap);
+
+    return 0;
+}
+
 static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
 {
     RKMPPEncContext *r = avctx->priv_data;
@@ -805,6 +881,9 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
 
     if (avctx->codec_id == AV_CODEC_ID_H264 ||
         avctx->codec_id == AV_CODEC_ID_HEVC) {
+        if ((ret = rkmpp_set_ref_cfg(avctx)) < 0)
+            return ret;
+
         /* user data SEI from the frame meta is written in any mode */
         sei_mode = (r->intra_refresh && r->refresh_num)
                    ? MPP_ENC_SEI_MODE_ONE_FRAME : MPP_ENC_SEI_MODE_DISABLE;

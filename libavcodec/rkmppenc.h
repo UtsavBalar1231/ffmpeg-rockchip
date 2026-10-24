@@ -103,6 +103,8 @@ typedef struct RKMPPEncContext {
     int                refresh_mode;
     int                refresh_num;
     int                max_slice_size;
+    int                temporal_layers;
+    int                ltr_interval;
 } RKMPPEncContext;
 
 static const AVRational mpp_tb = { 1, 1000000 };
@@ -143,6 +145,10 @@ static const AVRational mpp_tb = { 1, 1000000 };
             { .i64 = 1 }, 1, INT_MAX, VE, "refresh_num" }, \
     { "max_slice_size", "Encoded slice size in bytes after which a slice ends at the next MB or CTU", OFFSET(max_slice_size), AV_OPT_TYPE_INT, \
             { .i64 = 0 }, 0, INT_MAX, VE }, \
+    { "temporal_layers", "Set the number of temporal layers (L1T1 to L1T4)", OFFSET(temporal_layers), AV_OPT_TYPE_INT, \
+            { .i64 = 1 }, 1, 4, VE }, \
+    { "ltr_interval", "Mark a long-term reference every this many frames, which refers to the previous one (0 = off)", \
+            OFFSET(ltr_interval), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, INT_MAX, VE }, \
 
 static const AVOption h264_options[] = {
     RKMPP_ENC_COMMON_OPTS
