@@ -105,6 +105,7 @@ typedef struct RKMPPEncContext {
     int                max_slice_size;
     int                temporal_layers;
     int                ltr_interval;
+    int                restart_interval;
 } RKMPPEncContext;
 
 static const AVRational mpp_tb = { 1, 1000000 };
@@ -234,6 +235,8 @@ static const AVOption mjpeg_options[] = {
         { "420",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MPP_CHROMA_420 }, 0, 0, VE, .unit = "chroma_fmt" },
         { "422",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MPP_CHROMA_422 }, 0, 0, VE, .unit = "chroma_fmt" },
         { "444",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = MPP_CHROMA_444 }, 0, 0, VE, .unit = "chroma_fmt" },
+    { "restart_interval", "Set the restart interval in MCUs (0 = off)", OFFSET(restart_interval), AV_OPT_TYPE_INT,
+            { .i64 = 0 }, 0, UINT16_MAX, VE },
     { NULL },
 };
 

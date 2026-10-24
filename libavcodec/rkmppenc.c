@@ -835,6 +835,14 @@ static int rkmpp_set_enc_cfg(AVCodecContext *avctx)
                 mpp_enc_cfg_set_s32(cfg, "jpeg:qf_max", qp_max);
                 mpp_enc_cfg_set_s32(cfg, "jpeg:qf_min", qp_min);
             }
+
+            /* MPP writes a DRI and has the encoder emit RSTn every split_arg MCUs */
+            if (r->restart_interval > 0) {
+                mpp_enc_cfg_set_u32(cfg, "split:mode", MPP_ENC_SPLIT_BY_CTU);
+                mpp_enc_cfg_set_u32(cfg, "split:arg", r->restart_interval);
+                av_log(avctx, AV_LOG_VERBOSE, "Restart interval is set to %d MCUs\n",
+                       r->restart_interval);
+            }
         }
         break;
     default:
